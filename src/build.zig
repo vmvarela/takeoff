@@ -23,8 +23,10 @@ pub const BuildTarget = struct {
     cpu: ?[]const u8,
     /// The target triple string for Zig (e.g., "x86_64-linux-gnu")
     target_string: []const u8,
-    /// The output path for the binary
+    /// The output path/name for packaging (e.g., "zr-x86_64-linux")
     output_path: []const u8,
+    /// The project name (used to find the binary zig actually produces)
+    project_name: []const u8,
     /// Additional build flags
     flags: []const []const u8,
 
@@ -64,6 +66,7 @@ pub const BuildTarget = struct {
             .cpu = if (target.cpu) |c| try allocator.dupe(u8, c) else null,
             .target_string = target_string,
             .output_path = output_path,
+            .project_name = try allocator.dupe(u8, project_name),
             .flags = flags_copy,
         };
     }
@@ -75,6 +78,7 @@ pub const BuildTarget = struct {
         if (self.cpu) |c| allocator.free(c);
         allocator.free(self.target_string);
         allocator.free(self.output_path);
+        allocator.free(self.project_name);
         for (self.flags) |f| allocator.free(f);
         allocator.free(self.flags);
     }
@@ -204,6 +208,7 @@ pub const BuildResult = struct {
 /// Run zig build for a single target.
 pub fn runBuild(
     allocator: std.mem.Allocator,
+    io: std.Io,
     target: BuildTarget,
     optimize: []const u8,
     verbose: bool,
@@ -245,7 +250,6 @@ pub fn runBuild(
         log.debug("Command: {s}", .{cmd_line.items});
     }
 
-    const io = std.Options.debug_io;
     const run_result = std.process.run(allocator, io, .{
         .argv = argv.items,
         .stdout_limit = .limited(10 * 1024 * 1024),
@@ -287,35 +291,50 @@ pub fn runBuild(
         };
     }
 
-    // Verify the artifact exists
-    // The artifact should be in zig-out/bin/ or as specified by -Dprefix
-    const artifact_path = try std.fmt.allocPrint(allocator, "zig-out/bin/{s}", .{target.output_path});
-
-    // Try to find the binary - it might have different names depending on build.zig
+    // Locate the artifact produced by zig build.
+    // zig build always names the binary after the executable name in build.zig,
+    // which is typically the project name. Try that first, then the output_path template.
+    const ext = getBinaryExtension(target.os);
     const cwd = std.Io.Dir.cwd();
-    cwd.access(io, artifact_path, .{}) catch {
-        // Try alternative locations
-        const alt_path = try std.fmt.allocPrint(allocator, "zig-out/bin/{s}{s}", .{
-            std.fs.path.basename(target.output_path),
-            getBinaryExtension(target.os),
-        });
-        defer allocator.free(alt_path);
 
-        cwd.access(io, alt_path, .{}) catch {
-            allocator.free(artifact_path);
-            const msg = try std.fmt.allocPrint(
-                allocator,
-                "Artifact not found at expected path: {s}",
-                .{artifact_path},
-            );
-            return BuildResult{
-                .target = target,
-                .success = false,
-                .artifact_path = null,
-                .error_message = msg,
-            };
+    // Primary: zig-out/bin/{project_name}{ext}  (what `zig build` actually produces)
+    const primary_path = try std.fmt.allocPrint(allocator, "zig-out/bin/{s}{s}", .{ target.project_name, ext });
+    errdefer allocator.free(primary_path);
+
+    if (cwd.access(io, primary_path, .{})) |_| {
+        if (verbose) {
+            log.info("✓ Built: {s}", .{primary_path});
+        }
+        return BuildResult{
+            .target = target,
+            .success = true,
+            .artifact_path = primary_path,
+            .error_message = null,
+        };
+    } else |_| {}
+
+    // Fallback: zig-out/bin/{output_path}  (in case project uses custom naming)
+    const fallback_path = try std.fmt.allocPrint(allocator, "zig-out/bin/{s}", .{target.output_path});
+    defer allocator.free(fallback_path);
+
+    cwd.access(io, fallback_path, .{}) catch {
+        allocator.free(primary_path);
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "Artifact not found: tried zig-out/bin/{s}{s} and zig-out/bin/{s}",
+            .{ target.project_name, ext, target.output_path },
+        );
+        return BuildResult{
+            .target = target,
+            .success = false,
+            .artifact_path = null,
+            .error_message = msg,
         };
     };
+
+    // Use the fallback path (copy it since we deferred free above)
+    const artifact_path = try allocator.dupe(u8, fallback_path);
+    allocator.free(primary_path);
 
     if (verbose) {
         log.info("✓ Built: {s}", .{artifact_path});

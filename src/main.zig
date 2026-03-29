@@ -728,6 +728,7 @@ fn executeBuild(allocator: std.mem.Allocator, io: std.Io, opts: BuildOptions) u8
     // Run parallel builds
     const summary = parallel_build.runParallelBuilds(
         allocator,
+        io,
         cfg.targets,
         cfg.project.name,
         cfg.build.output,
@@ -763,6 +764,7 @@ fn executeBuild(allocator: std.mem.Allocator, io: std.Io, opts: BuildOptions) u8
     // Generate packages
     const package_summary = ZigReleaser.packager.generatePackages(
         allocator,
+        io,
         cfg,
         version,
         artifact_paths,

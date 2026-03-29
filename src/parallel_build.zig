@@ -135,6 +135,7 @@ const WorkerContext = struct {
 /// Run builds for all targets in parallel using a thread pool.
 pub fn runParallelBuilds(
     allocator: std.mem.Allocator,
+    io: std.Io,
     targets: []const config.Target,
     project_name: []const u8,
     output_template: ?[]const u8,
@@ -144,7 +145,6 @@ pub fn runParallelBuilds(
     job_count: usize,
     verbose: bool,
 ) ParallelBuildError!BuildSummary {
-    const io = std.Options.debug_io;
     _ = job_count;
     if (targets.len == 0) {
         return BuildSummary{
@@ -270,6 +270,7 @@ fn workerRunBuild(context: *const WorkerContext, job: *BuildJob) std.Io.Cancelab
     // Run the build
     const result = build_mod.runBuild(
         temp_allocator,
+        context.io,
         target,
         context.optimize,
         context.verbose,

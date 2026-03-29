@@ -87,13 +87,14 @@ fn formatTargetTriple(allocator: std.mem.Allocator, target: config.Target) std.m
 }
 
 /// Ensure a directory exists, creating it if necessary.
-fn ensureDirectory(path: []const u8) !void {
-    try std.Io.Dir.cwd().createDirPath(std.Options.debug_io, path);
+fn ensureDirectory(io: std.Io, path: []const u8) !void {
+    try std.Io.Dir.cwd().createDirPath(io, path);
 }
 
 /// Package a single target.
 fn packageTarget(
     allocator: std.mem.Allocator,
+    io: std.Io,
     target: config.Target,
     binary_path: []const u8,
     project_name: []const u8,
@@ -120,7 +121,7 @@ fn packageTarget(
     defer allocator.free(output_path);
 
     // Ensure output directory exists
-    ensureDirectory(output_dir) catch |err| {
+    ensureDirectory(io, output_dir) catch |err| {
         const error_msg = try std.fmt.allocPrint(
             allocator,
             "Failed to create output directory: {}",
@@ -162,7 +163,7 @@ fn packageTarget(
     };
 
     // Create the archive
-    const archive_result = try archive.createArchive(allocator, std.Options.debug_io, archive_config);
+    const archive_result = try archive.createArchive(allocator, io, archive_config);
 
     if (archive_result.success) {
         const path_copy = if (archive_result.output_path) |p|
@@ -205,13 +206,13 @@ const PackageWorkerContext = struct {
 /// Generate packages for all targets in parallel.
 pub fn generatePackages(
     allocator: std.mem.Allocator,
+    io: std.Io,
     cfg: config.Config,
     version: []const u8,
     binary_paths: []const ?[]const u8,
     output_dir: []const u8,
     job_count: usize,
 ) PackageError!PackageSummary {
-    const io = std.Options.debug_io;
     _ = job_count;
     // Check if packaging is configured
     const pkg_config: ?config.TarballPackage = if (cfg.packages) |p|
@@ -359,6 +360,7 @@ fn packageWorker(
 
     const result = packageTarget(
         temp_allocator,
+        context.io,
         target,
         binary_path,
         context.cfg.project.name,
@@ -518,6 +520,7 @@ test "generatePackages with no config returns empty summary" {
 
     const summary = try generatePackages(
         allocator,
+        std.Options.debug_io,
         cfg,
         "1.0.0",
         &.{},
