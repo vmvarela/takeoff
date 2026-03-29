@@ -293,11 +293,10 @@ pub fn main(init: std.process.Init) u8 {
     };
     defer command.deinit(allocator);
 
-    return executeCommand(allocator, command);
+    return executeCommand(allocator, init.io, command);
 }
 
-fn executeCommand(allocator: std.mem.Allocator, command: Command) u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn executeCommand(allocator: std.mem.Allocator, io: std.Io, command: Command) u8 {
     const stdout_file = std.Io.File.stdout();
     const stderr_file = std.Io.File.stderr();
     var stdout_buffer: [4096]u8 = undefined;
@@ -328,42 +327,339 @@ fn executeCommand(allocator: std.mem.Allocator, command: Command) u8 {
             };
         },
         .check => {
-            const check_allocator = std.heap.smp_allocator;
-
-            var cfg = ZigReleaser.config.loadDefault(check_allocator, io) catch |err| {
-                stderr_writer.interface.print("Error: ", .{}) catch {};
-                ZigReleaser.config.formatParseError(err, &stderr_writer.interface) catch {};
-                stderr_writer.interface.print("\n", .{}) catch {};
-                return 1;
-            };
-
-            ZigReleaser.config.validate(&cfg) catch |err| {
-                stderr_writer.interface.print("Validation error: ", .{}) catch {};
-                ZigReleaser.config.formatValidationError(err, &stderr_writer.interface) catch {};
-                stderr_writer.interface.print("\n", .{}) catch {};
-                return 1;
-            };
-
-            stdout_writer.interface.writeAll("✓ zr.jsonc is valid\n") catch |err| {
-                log.err("failed to write output: {}", .{err});
-                return 1;
-            };
+            return executeCheck(allocator, io);
         },
         .build => |opts| {
-            return executeBuild(allocator, opts);
+            return executeBuild(allocator, io, opts);
         },
         .verify => |opts| {
-            return executeVerify(allocator, opts);
+            return executeVerify(allocator, io, opts);
         },
         .release => |opts| {
-            return executeRelease(allocator, opts);
+            return executeRelease(allocator, io, opts);
         },
     }
     return 0;
 }
 
-fn executeBuild(allocator: std.mem.Allocator, opts: BuildOptions) u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+const CheckState = enum { pass, fail, warn };
+
+const CheckResult = struct {
+    state: CheckState,
+    message: []const u8,
+};
+
+fn printCheckResult(writer: *std.Io.Writer, result: CheckResult) void {
+    const symbol = switch (result.state) {
+        .pass => "✓",
+        .fail => "✗",
+        .warn => "!",
+    };
+    writer.print("{s} {s}\n", .{ symbol, result.message }) catch {};
+}
+
+fn executeCheck(allocator: std.mem.Allocator, io: std.Io) u8 {
+    const stdout_file = std.Io.File.stdout();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stdout_writer = stdout_file.writer(io, &stdout_buffer);
+    defer stdout_writer.interface.flush() catch {};
+    const out = &stdout_writer.interface;
+
+    out.writeAll("Pre-flight checks\n") catch {};
+    out.writeAll("================\n") catch {};
+
+    var required_failures: usize = 0;
+
+    const config_path = config.find(allocator, io) catch |err| {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Config ({s})", .{@errorName(err)}) catch "Config (error)";
+        printCheckResult(out, .{ .state = .fail, .message = msg });
+        printCheckResult(out, .{ .state = .fail, .message = "Cannot continue without a valid config file" });
+        return 1;
+    };
+    defer allocator.free(config_path);
+
+    var cfg = config.load(allocator, io, config_path) catch |err| {
+        var msg_buf: [192]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Config parse failed ({s})", .{@errorName(err)}) catch "Config parse failed";
+        printCheckResult(out, .{ .state = .fail, .message = msg });
+        return 1;
+    };
+
+    config.validate(&cfg) catch |err| {
+        var msg_buf: [192]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Config validation failed ({s})", .{@errorName(err)}) catch "Config validation failed";
+        printCheckResult(out, .{ .state = .fail, .message = msg });
+        return 1;
+    };
+
+    {
+        const msg = std.fmt.allocPrint(allocator, "Config OK: {s}", .{config_path}) catch "Config OK";
+        defer if (msg.ptr != "Config OK".ptr) allocator.free(msg);
+        printCheckResult(out, .{ .state = .pass, .message = msg });
+    }
+
+    const required_zig_version = cfg.build.zig_version orelse "0.16.0";
+    const zig_version_result = std.process.run(allocator, io, .{
+        .argv = &.{ "zig", "version" },
+        .stdout_limit = .limited(1024),
+        .stderr_limit = .limited(1024),
+    }) catch {
+        printCheckResult(out, .{ .state = .fail, .message = "zig not found in PATH" });
+        required_failures += 1;
+        return finishCheck(out, required_failures);
+    };
+    defer {
+        allocator.free(zig_version_result.stdout);
+        allocator.free(zig_version_result.stderr);
+    }
+
+    if (zig_version_result.term == .exited and zig_version_result.term.exited == 0) {
+        const installed = std.mem.trim(u8, zig_version_result.stdout, " \n\r\t");
+        if (isVersionAtLeast(installed, required_zig_version)) {
+            const msg = std.fmt.allocPrint(allocator, "zig version OK: {s} (required >= {s})", .{ installed, required_zig_version }) catch "zig version OK";
+            defer if (msg.ptr != "zig version OK".ptr) allocator.free(msg);
+            printCheckResult(out, .{ .state = .pass, .message = msg });
+        } else {
+            const msg = std.fmt.allocPrint(allocator, "zig version too old: {s} (required >= {s})", .{ installed, required_zig_version }) catch "zig version too old";
+            defer if (msg.ptr != "zig version too old".ptr) allocator.free(msg);
+            printCheckResult(out, .{ .state = .fail, .message = msg });
+            required_failures += 1;
+        }
+    } else {
+        printCheckResult(out, .{ .state = .fail, .message = "failed to run `zig version`" });
+        required_failures += 1;
+    }
+
+    const token_check = checkGitHubToken(allocator, io, cfg);
+    printCheckResult(out, token_check.result);
+    if (!token_check.ok) required_failures += 1;
+
+    for (cfg.targets) |target| {
+        const dry_run_result = dryRunTargetBuild(allocator, io, cfg, target);
+        printCheckResult(out, dry_run_result.result);
+        if (!dry_run_result.ok) required_failures += 1;
+    }
+
+    out.writeAll("\nOptional tools\n") catch {};
+    out.writeAll("--------------\n") catch {};
+    const optional_tools = [_][]const u8{
+        "appimagetool",
+        "wixl",
+        "gpg",
+        "dpkg-deb",
+        "rpmbuild",
+        "apk",
+        "makepkg",
+    };
+
+    for (optional_tools) |tool| {
+        const available = commandExists(allocator, io, tool);
+        const msg = std.fmt.allocPrint(allocator, "{s}", .{tool}) catch tool;
+        defer if (msg.ptr != tool.ptr) allocator.free(msg);
+        printCheckResult(out, .{ .state = if (available) .pass else .warn, .message = msg });
+    }
+
+    return finishCheck(out, required_failures);
+}
+
+fn finishCheck(out: *std.Io.Writer, required_failures: usize) u8 {
+    if (required_failures == 0) {
+        out.writeAll("\nAll required checks passed.\n") catch {};
+        return 0;
+    }
+    out.print("\nRequired checks failed: {d}\n", .{required_failures}) catch {};
+    return 1;
+}
+
+fn commandExists(allocator: std.mem.Allocator, io: std.Io, command_name: []const u8) bool {
+    const run_result = std.process.run(allocator, io, .{
+        .argv = &.{ command_name, "--version" },
+        .stdout_limit = .limited(256),
+        .stderr_limit = .limited(256),
+    }) catch {
+        return false;
+    };
+    defer {
+        allocator.free(run_result.stdout);
+        allocator.free(run_result.stderr);
+    }
+    return true;
+}
+
+const CheckBoolResult = struct {
+    ok: bool,
+    result: CheckResult,
+};
+
+fn checkGitHubToken(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config) CheckBoolResult {
+    const environ = std.Options.debug_threaded_io.?.environ.process_environ;
+    const token = std.process.Environ.getAlloc(environ, allocator, "GITHUB_TOKEN") catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "GITHUB_TOKEN is not set" } };
+    };
+    defer allocator.free(token);
+
+    if (token.len == 0) {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "GITHUB_TOKEN is empty" } };
+    }
+
+    const owner = if (cfg.release) |rel|
+        if (rel.github) |gh| gh.owner else ""
+    else
+        "";
+    const repo = if (cfg.release) |rel|
+        if (rel.github) |gh| gh.repo else ""
+    else
+        "";
+
+    if (owner.len == 0 or repo.len == 0) {
+        return .{ .ok = true, .result = .{ .state = .warn, .message = "GITHUB_TOKEN set (repo permission check skipped: no release.github config)" } };
+    }
+
+    var client = std.http.Client{ .allocator = allocator, .io = io };
+    defer client.deinit();
+
+    const url = std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/{s}", .{ owner, repo }) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to build GitHub API URL" } };
+    };
+    defer allocator.free(url);
+
+    const auth_value = std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to build auth header" } };
+    };
+    defer allocator.free(auth_value);
+
+    const headers = [_]std.http.Header{
+        .{ .name = "Accept", .value = "application/vnd.github+json" },
+        .{ .name = "Authorization", .value = auth_value },
+        .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
+    };
+
+    const uri = std.Uri.parse(url) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to parse GitHub API URL" } };
+    };
+    var req = client.request(.GET, uri, .{ .extra_headers = &headers }) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to connect to GitHub API" } };
+    };
+    defer req.deinit();
+
+    req.sendBodiless() catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to send GitHub API request" } };
+    };
+
+    var redirect_buffer: [16 * 1024]u8 = undefined;
+    var response = req.receiveHead(&redirect_buffer) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to read GitHub API response" } };
+    };
+
+    const body = response.reader(&.{}).allocRemaining(allocator, .limited(16 * 1024)) catch "";
+    defer allocator.free(body);
+
+    const status = response.head.status;
+    if (status == .ok) {
+        const msg = std.fmt.allocPrint(allocator, "GITHUB_TOKEN OK: can access {s}/{s}", .{ owner, repo }) catch "GITHUB_TOKEN OK";
+        return .{ .ok = true, .result = .{ .state = .pass, .message = msg } };
+    }
+
+    const msg = std.fmt.allocPrint(allocator, "GITHUB_TOKEN rejected for {s}/{s} (status {d})", .{ owner, repo, @intFromEnum(status) }) catch "GITHUB_TOKEN rejected";
+    return .{ .ok = false, .result = .{ .state = .fail, .message = msg } };
+}
+
+fn dryRunTargetBuild(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config, target: config.Target) CheckBoolResult {
+    var build_target = build_mod.BuildTarget.fromConfig(
+        allocator,
+        target,
+        cfg.project.name,
+        cfg.build.output,
+        cfg.build.flags,
+        null,
+    ) catch {
+        const msg = std.fmt.allocPrint(allocator, "build target setup failed: {s}-{s}", .{ target.arch, target.os }) catch "build target setup failed";
+        return .{ .ok = false, .result = .{ .state = .fail, .message = msg } };
+    };
+    defer build_target.deinit(allocator);
+
+    const target_flag = std.fmt.allocPrint(allocator, "-Dtarget={s}", .{build_target.target_string}) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to create target flag" } };
+    };
+    defer allocator.free(target_flag);
+
+    const optimize_flag = std.fmt.allocPrint(allocator, "-Doptimize=ReleaseSafe", .{}) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to create optimize flag" } };
+    };
+    defer allocator.free(optimize_flag);
+
+    const base_len: usize = 7;
+    const total_len = base_len + cfg.build.flags.len;
+    const argv = allocator.alloc([]const u8, total_len) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to allocate dry-run args" } };
+    };
+    defer allocator.free(argv);
+
+    argv[0] = "zig";
+    argv[1] = "build";
+    argv[2] = "--fetch=needed";
+    argv[3] = "--summary";
+    argv[4] = "none";
+    argv[5] = target_flag;
+    argv[6] = optimize_flag;
+    for (cfg.build.flags, 0..) |flag, i| {
+        argv[base_len + i] = flag;
+    }
+
+    const run_result = std.process.run(allocator, io, .{
+        .argv = argv,
+        .stdout_limit = .limited(4 * 1024),
+        .stderr_limit = .limited(16 * 1024),
+    }) catch {
+        const msg = std.fmt.allocPrint(allocator, "dry-run failed for target {s}", .{build_target.target_string}) catch "dry-run failed";
+        return .{ .ok = false, .result = .{ .state = .fail, .message = msg } };
+    };
+    defer {
+        allocator.free(run_result.stdout);
+        allocator.free(run_result.stderr);
+    }
+
+    if (run_result.term == .exited and run_result.term.exited == 0) {
+        const msg = std.fmt.allocPrint(allocator, "dry-run target OK: {s}", .{build_target.target_string}) catch "dry-run target OK";
+        return .{ .ok = true, .result = .{ .state = .pass, .message = msg } };
+    }
+
+    const msg = std.fmt.allocPrint(allocator, "dry-run target failed: {s}", .{build_target.target_string}) catch "dry-run target failed";
+    return .{ .ok = false, .result = .{ .state = .fail, .message = msg } };
+}
+
+fn parseVersionTriple(version: []const u8) [3]u32 {
+    var values: [3]u32 = .{ 0, 0, 0 };
+    var i: usize = 0;
+    var index: usize = 0;
+
+    while (i < version.len and index < 3) {
+        while (i < version.len and !std.ascii.isDigit(version[i])) : (i += 1) {}
+        if (i >= version.len) break;
+
+        const start = i;
+        while (i < version.len and std.ascii.isDigit(version[i])) : (i += 1) {}
+
+        values[index] = std.fmt.parseInt(u32, version[start..i], 10) catch 0;
+        index += 1;
+    }
+
+    return values;
+}
+
+fn isVersionAtLeast(installed: []const u8, minimum: []const u8) bool {
+    const installed_triplet = parseVersionTriple(installed);
+    const minimum_triplet = parseVersionTriple(minimum);
+
+    inline for (0..3) |idx| {
+        if (installed_triplet[idx] > minimum_triplet[idx]) return true;
+        if (installed_triplet[idx] < minimum_triplet[idx]) return false;
+    }
+    return true;
+}
+
+fn executeBuild(allocator: std.mem.Allocator, io: std.Io, opts: BuildOptions) u8 {
     const stdout_file = std.Io.File.stdout();
     const stderr_file = std.Io.File.stderr();
     var stdout_buffer: [4096]u8 = undefined;
@@ -490,8 +786,7 @@ fn executeBuild(allocator: std.mem.Allocator, opts: BuildOptions) u8 {
     return 0;
 }
 
-fn executeVerify(allocator: std.mem.Allocator, opts: VerifyOptions) u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn executeVerify(allocator: std.mem.Allocator, io: std.Io, opts: VerifyOptions) u8 {
     const stdout_file = std.Io.File.stdout();
     const stderr_file = std.Io.File.stderr();
     var stdout_buffer: [4096]u8 = undefined;
@@ -520,8 +815,7 @@ fn executeVerify(allocator: std.mem.Allocator, opts: VerifyOptions) u8 {
     return 0;
 }
 
-fn executeRelease(allocator: std.mem.Allocator, opts: ReleaseOptions) u8 {
-    const io = std.Io.Threaded.global_single_threaded.io();
+fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions) u8 {
     const stdout_file = std.Io.File.stdout();
     const stderr_file = std.Io.File.stderr();
     var stdout_buffer: [4096]u8 = undefined;

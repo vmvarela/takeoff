@@ -119,6 +119,78 @@ fn isJsoncFile(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".jsonc");
 }
 
+fn dupeOptStr(allocator: std.mem.Allocator, s: ?[]const u8) !?[]const u8 {
+    return if (s) |str| try allocator.dupe(u8, str) else null;
+}
+
+fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
+    const name = try allocator.dupe(u8, src.project.name);
+    errdefer allocator.free(name);
+
+    const project = Project{
+        .name = name,
+        .version = try dupeOptStr(allocator, src.project.version),
+        .description = try dupeOptStr(allocator, src.project.description),
+        .license = try dupeOptStr(allocator, src.project.license),
+    };
+
+    const zig_version = try dupeOptStr(allocator, src.build.zig_version);
+    const output = try dupeOptStr(allocator, src.build.output);
+    const output_dir = try dupeOptStr(allocator, src.build.output_dir);
+
+    const flags = try allocator.alloc([]const u8, src.build.flags.len);
+    for (src.build.flags, 0..) |f, i| flags[i] = try allocator.dupe(u8, f);
+
+    const build = Build{
+        .zig_version = zig_version,
+        .output = output,
+        .output_dir = output_dir,
+        .flags = flags,
+    };
+
+    const targets = try allocator.alloc(Target, src.targets.len);
+    for (src.targets, 0..) |t, i| {
+        targets[i] = Target{
+            .os = try allocator.dupe(u8, t.os),
+            .arch = try allocator.dupe(u8, t.arch),
+            .cpu = try dupeOptStr(allocator, t.cpu),
+            .abi = try dupeOptStr(allocator, t.abi),
+        };
+    }
+
+    const packages: ?Packages = if (src.packages) |pkg| blk: {
+        const tarball: ?TarballPackage = if (pkg.tarball) |tb| blk2: {
+            const extra = try allocator.alloc([]const u8, tb.extra_files.len);
+            for (tb.extra_files, 0..) |f, i| extra[i] = try allocator.dupe(u8, f);
+            break :blk2 TarballPackage{
+                .format = try dupeOptStr(allocator, tb.format),
+                .extra_files = extra,
+                .man_pages = try dupeOptStr(allocator, tb.man_pages),
+                .completions = try dupeOptStr(allocator, tb.completions),
+            };
+        } else null;
+        break :blk Packages{ .tarball = tarball };
+    } else null;
+
+    const release: ?Release = if (src.release) |rel| blk: {
+        const github: ?GitHubRelease = if (rel.github) |gh| GitHubRelease{
+            .owner = try allocator.dupe(u8, gh.owner),
+            .repo = try allocator.dupe(u8, gh.repo),
+            .draft = gh.draft,
+            .prerelease = gh.prerelease,
+        } else null;
+        break :blk Release{ .github = github };
+    } else null;
+
+    return Config{
+        .project = project,
+        .build = build,
+        .targets = targets,
+        .packages = packages,
+        .release = release,
+    };
+}
+
 pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ParseError!Config {
     const cwd = std.Io.Dir.cwd();
     const content = cwd.readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch |err| {
@@ -129,6 +201,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ParseErr
     };
     defer allocator.free(content);
 
+    // Strip JSONC comments if needed
     const json_content: []const u8 = if (isJsoncFile(path)) blk: {
         const stripped = jsonc.stripComments(allocator, content) catch |err| {
             log.err("failed to strip comments from {s}: {}", .{ path, err });
@@ -136,20 +209,21 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ParseErr
         };
         break :blk stripped;
     } else content;
+    defer if (isJsoncFile(path)) allocator.free(json_content);
 
-    const parsed = json.parseFromSlice(Config, allocator, json_content, .{
+    // Parse into a temporary arena, then deep-copy all strings into allocator.
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_alloc = arena.allocator();
+
+    const parsed = json.parseFromSlice(Config, arena_alloc, json_content, .{
         .ignore_unknown_fields = true,
     }) catch |err| {
         log.err("failed to parse {s}: {}", .{ path, err });
         return ParseError.InvalidJson;
     };
-    defer parsed.deinit();
 
-    if (isJsoncFile(path)) {
-        allocator.free(@constCast(json_content));
-    }
-
-    return parsed.value;
+    return deepCopyConfig(allocator, parsed.value) catch return ParseError.OutOfMemory;
 }
 
 pub fn loadDefault(allocator: std.mem.Allocator, io: std.Io) ParseError!Config {
