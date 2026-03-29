@@ -43,7 +43,9 @@ pub const ReleaseInfo = struct {
 
     pub fn deinit(self: *ReleaseInfo, allocator: std.mem.Allocator) void {
         allocator.free(self.tag_name);
-        allocator.free(self.name);
+        if (self.name.ptr != self.tag_name.ptr) {
+            allocator.free(self.name);
+        }
         allocator.free(self.body);
         allocator.free(self.html_url);
         allocator.free(self.upload_url);
@@ -753,13 +755,16 @@ fn parseReleaseResponse(allocator: std.mem.Allocator, json_data: []const u8) Git
     const name = extractJsonString(allocator, json_data, "\"name\":\"") orelse tag_name;
     errdefer if (name.ptr != tag_name.ptr) allocator.free(name);
 
-    const body = extractJsonString(allocator, json_data, "\"body\":\"") orelse "";
+    const body = extractJsonString(allocator, json_data, "\"body\":\"") orelse
+        try allocator.dupe(u8, "");
     errdefer allocator.free(body);
 
-    const html_url = extractJsonString(allocator, json_data, "\"html_url\":\"") orelse "";
+    const html_url = extractJsonString(allocator, json_data, "\"html_url\":\"") orelse
+        try allocator.dupe(u8, "");
     errdefer allocator.free(html_url);
 
-    const upload_url = extractJsonString(allocator, json_data, "\"upload_url\":\"") orelse "";
+    const upload_url = extractJsonString(allocator, json_data, "\"upload_url\":\"") orelse
+        try allocator.dupe(u8, "");
     errdefer allocator.free(upload_url);
 
     // For simplicity, we're not parsing assets in detail here
@@ -783,15 +788,16 @@ fn parseReleaseResponse(allocator: std.mem.Allocator, json_data: []const u8) Git
 fn parseAssetResponse(allocator: std.mem.Allocator, json_data: []const u8) GitHubError!AssetInfo {
     const id = extractJsonU64(json_data, "\"id\":") orelse 0;
 
-    const name = extractJsonString(allocator, json_data, "\"name\":\"") orelse "unknown";
+    const name = extractJsonString(allocator, json_data, "\"name\":\"") orelse
+        try allocator.dupe(u8, "unknown");
     errdefer allocator.free(name);
 
     const content_type = extractJsonString(allocator, json_data, "\"content_type\":\"") orelse
-        "application/octet-stream";
+        try allocator.dupe(u8, "application/octet-stream");
     errdefer allocator.free(content_type);
 
     const browser_download_url = extractJsonString(allocator, json_data, "\"browser_download_url\":\"") orelse
-        "";
+        try allocator.dupe(u8, "");
     errdefer allocator.free(browser_download_url);
 
     const size = extractJsonU64(json_data, "\"size\":") orelse 0;
@@ -1102,4 +1108,38 @@ test "unescapeJsonString handles unicode" {
     defer allocator.free(unescaped);
 
     try std.testing.expectEqualStrings("Hello", unescaped);
+}
+
+test "parseReleaseResponse handles missing optional fields" {
+    const allocator = std.testing.allocator;
+
+    const json_data =
+        \\{"id":123,"tag_name":"v1.2.3"}
+    ;
+
+    var release = try parseReleaseResponse(allocator, json_data);
+    defer release.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 123), release.id);
+    try std.testing.expectEqualStrings("v1.2.3", release.tag_name);
+    try std.testing.expectEqualStrings("v1.2.3", release.name);
+    try std.testing.expectEqualStrings("", release.body);
+    try std.testing.expectEqualStrings("", release.html_url);
+    try std.testing.expectEqualStrings("", release.upload_url);
+}
+
+test "parseAssetResponse handles missing optional fields" {
+    const allocator = std.testing.allocator;
+
+    const json_data =
+        \\{"id":999}
+    ;
+
+    var asset = try parseAssetResponse(allocator, json_data);
+    defer asset.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 999), asset.id);
+    try std.testing.expectEqualStrings("unknown", asset.name);
+    try std.testing.expectEqualStrings("application/octet-stream", asset.content_type);
+    try std.testing.expectEqualStrings("", asset.browser_download_url);
 }
