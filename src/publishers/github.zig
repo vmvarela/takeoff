@@ -150,7 +150,7 @@ pub const GitHubClient = struct {
 
     /// Build extra headers for GitHub API requests.
     fn buildHeaders(self: *GitHubClient, include_content_type: bool) GitHubError![]const std.http.Header {
-        var headers = try self.allocator.alloc(std.http.Header, if (include_content_type) 4 else 3);
+        var headers = try self.allocator.alloc(std.http.Header, if (include_content_type) 5 else 4);
         errdefer self.allocator.free(headers);
 
         headers[0] = .{ .name = "Accept", .value = "application/vnd.github+json" };
@@ -159,9 +159,10 @@ pub const GitHubClient = struct {
             .value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{self.token}),
         };
         headers[2] = .{ .name = "X-GitHub-Api-Version", .value = api_version };
+        headers[3] = .{ .name = "Accept-Encoding", .value = "identity" };
 
         if (include_content_type) {
-            headers[3] = .{ .name = "Content-Type", .value = "application/json" };
+            headers[4] = .{ .name = "Content-Type", .value = "application/json" };
         }
 
         return headers;
@@ -279,10 +280,28 @@ pub const GitHubClient = struct {
             return error.NetworkError;
         };
         defer self.allocator.free(response_bytes);
-        response_body.appendSlice(self.allocator, response_bytes) catch |err| {
-            log.err("failed to append to response buffer: {}", .{err});
-            return error.NetworkError;
-        };
+
+        // Detect gzip by magic bytes (1F 8B) — Zig's http client negotiates gzip automatically
+        if (response_bytes.len >= 2 and response_bytes[0] == 0x1f and response_bytes[1] == 0x8b) {
+            var input_reader: std.Io.Reader = .fixed(response_bytes);
+            var decompress_buffer: [65536]u8 = undefined;
+            var decompress: std.compress.flate.Decompress = .init(&input_reader, .gzip, &decompress_buffer);
+            // Read all decompressed data
+            while (true) {
+                var chunk: [4096]u8 = undefined;
+                const n = decompress.reader.readSliceShort(&chunk) catch break;
+                if (n == 0) break;
+                response_body.appendSlice(self.allocator, chunk[0..n]) catch |err| {
+                    log.err("failed to append decompressed chunk: {}", .{err});
+                    return error.NetworkError;
+                };
+            }
+        } else {
+            response_body.appendSlice(self.allocator, response_bytes) catch |err| {
+                log.err("failed to append to response buffer: {}", .{err});
+                return error.NetworkError;
+            };
+        }
 
         const response_data = try self.allocator.dupe(u8, response_body.items);
         errdefer self.allocator.free(response_data);

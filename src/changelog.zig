@@ -124,9 +124,10 @@ fn extractNotesFromContent(
         content_start += 1;
     }
 
-    // Find the end of this section (next ## header or end of file)
+    // Find the end of this section (next level-2 ## header or end of file).
+    // Use "\n## " to avoid matching level-3 headers like "\n### Added".
     const section_end = blk: {
-        const next_header = std.mem.indexOf(u8, content[content_start..], "\n##");
+        const next_header = std.mem.indexOf(u8, content[content_start..], "\n## ");
         if (next_header) |pos| {
             break :blk content_start + pos;
         }
