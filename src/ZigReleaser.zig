@@ -7,6 +7,16 @@ const log = std.log.scoped(.ZigReleaser);
 pub const VERSION: []const u8 = build_options.version;
 
 pub const config = @import("config.zig");
+pub const build = @import("build.zig");
+pub const parallel_build = @import("parallel_build.zig");
+pub const git = @import("git.zig");
+pub const progress = @import("progress.zig");
+pub const archive = @import("archive.zig");
+pub const packager = @import("packager.zig");
+pub const checksum = @import("checksum.zig");
+pub const verify = @import("verify.zig");
+pub const changelog = @import("changelog.zig");
+pub const publishers = @import("publishers/mod.zig");
 
 pub const CliError = error{
     InvalidArguments,

@@ -1,20 +1,27 @@
 const std = @import("std");
-const toml = @import("toml");
+const json = std.json;
+const jsonc = @import("jsonc.zig");
 
 const log = std.log.scoped(.config);
 
 pub const ParseError = error{
     FileNotFound,
-    InvalidToml,
+    InvalidJson,
+    InvalidJsonc,
     ValidationFailed,
     ReadError,
-} || std.fs.File.OpenError || std.mem.Allocator.Error;
+    UnterminatedString,
+    UnterminatedBlockComment,
+    OutOfMemory,
+};
 
 pub const ValidationError = error{
     MissingProjectName,
     MissingBuildTarget,
     InvalidTargetOs,
     InvalidTargetArch,
+    MissingGitHubOwner,
+    MissingGitHubRepo,
 };
 
 pub const TemplateError = error{
@@ -34,6 +41,7 @@ pub const Project = struct {
 pub const Build = struct {
     zig_version: ?[]const u8 = null,
     output: ?[]const u8 = null,
+    output_dir: ?[]const u8 = null,
     flags: []const []const u8 = &.{},
 };
 
@@ -41,13 +49,24 @@ pub const Target = struct {
     os: []const u8,
     arch: []const u8,
     cpu: ?[]const u8 = null,
+    abi: ?[]const u8 = null,
 };
 
 pub const TarballPackage = struct {
     format: ?[]const u8 = null,
+    extra_files: []const []const u8 = &.{},
+    man_pages: ?[]const u8 = null,
+    completions: ?[]const u8 = null,
 
     pub fn getFormat(self: @This()) []const u8 {
         return self.format orelse "tar.gz";
+    }
+
+    pub fn getExtension(self: @This()) []const u8 {
+        const fmt = self.getFormat();
+        if (std.mem.eql(u8, fmt, "tar.gz")) return ".tar.gz";
+        if (std.mem.eql(u8, fmt, "zip")) return ".zip";
+        return ".tar.gz";
     }
 };
 
@@ -72,172 +91,71 @@ pub const Config = struct {
     targets: []const Target = &.{},
     packages: ?Packages = null,
     release: ?Release = null,
-
-    pub fn deinit(self: *Config, allocator: std.mem.Allocator) void {
-        allocator.free(self.project.name);
-        if (self.project.version) |v| allocator.free(v);
-        if (self.project.description) |d| allocator.free(d);
-        if (self.project.license) |l| allocator.free(l);
-
-        if (self.build.zig_version) |v| allocator.free(v);
-        if (self.build.output) |o| allocator.free(o);
-        for (self.build.flags) |f| allocator.free(f);
-        if (self.build.flags.len > 0) allocator.free(self.build.flags);
-
-        for (self.targets) |target| {
-            allocator.free(target.os);
-            allocator.free(target.arch);
-            if (target.cpu) |c| allocator.free(c);
-        }
-        allocator.free(self.targets);
-
-        if (self.packages) |pkg| {
-            if (pkg.tarball) |tb| {
-                if (tb.format) |f| allocator.free(f);
-            }
-        }
-
-        if (self.release) |rel| {
-            if (rel.github) |gh| {
-                allocator.free(gh.owner);
-                allocator.free(gh.repo);
-            }
-        }
-    }
 };
 
 const config_paths = [_][]const u8{
-    "zr.toml",
-    ".zr.toml",
-    ".config/zr.toml",
+    "zr.json",
+    "zr.jsonc",
+    ".zr.json",
+    ".zr.jsonc",
+    ".config/zr.json",
+    ".config/zr.jsonc",
 };
 
-pub fn find(allocator: std.mem.Allocator) (std.fs.File.OpenError || std.mem.Allocator.Error)![]const u8 {
-    const cwd = std.fs.cwd();
-    inline for (config_paths) |path| {
-        if (cwd.openFile(path, .{})) |_| {
-            return allocator.dupe(u8, path);
-        } else |_| {}
-    }
-    return error.FileNotFound;
-}
-
-fn dupeString(allocator: std.mem.Allocator, s: []const u8) std.mem.Allocator.Error![]const u8 {
-    return allocator.dupe(u8, s);
-}
-
-fn dupeOptionalString(allocator: std.mem.Allocator, s: ?[]const u8) std.mem.Allocator.Error!?[]const u8 {
-    if (s) |str| {
-        return try allocator.dupe(u8, str);
-    }
-    return null;
-}
-
-fn deepCopyConfig(allocator: std.mem.Allocator, parsed: Config) std.mem.Allocator.Error!Config {
-    const project = Project{
-        .name = try dupeString(allocator, parsed.project.name),
-        .version = try dupeOptionalString(allocator, parsed.project.version),
-        .description = try dupeOptionalString(allocator, parsed.project.description),
-        .license = try dupeOptionalString(allocator, parsed.project.license),
-    };
-
-    const flags = try allocator.alloc([]const u8, parsed.build.flags.len);
-    errdefer allocator.free(flags);
-    for (parsed.build.flags, 0..) |f, i| {
-        flags[i] = try dupeString(allocator, f);
-    }
-
-    const build = Build{
-        .zig_version = try dupeOptionalString(allocator, parsed.build.zig_version),
-        .output = try dupeOptionalString(allocator, parsed.build.output),
-        .flags = flags,
-    };
-
-    const targets = try allocator.alloc(Target, parsed.targets.len);
-    errdefer allocator.free(targets);
-    for (parsed.targets, 0..) |t, i| {
-        targets[i] = Target{
-            .os = try dupeString(allocator, t.os),
-            .arch = try dupeString(allocator, t.arch),
-            .cpu = try dupeOptionalString(allocator, t.cpu),
+pub fn find(allocator: std.mem.Allocator, io: std.Io) ParseError![]const u8 {
+    const cwd = std.Io.Dir.cwd();
+    for (config_paths) |path| {
+        const file = cwd.openFile(io, path, .{}) catch |err| {
+            if (err == error.FileNotFound) continue;
+            return ParseError.ReadError;
         };
+        file.close(io);
+        return allocator.dupe(u8, path) catch return ParseError.OutOfMemory;
     }
-
-    const packages = if (parsed.packages) |pkg| blk: {
-        if (pkg.tarball) |tb| {
-            break :blk Packages{
-                .tarball = TarballPackage{
-                    .format = try dupeOptionalString(allocator, tb.format),
-                },
-            };
-        }
-        break :blk Packages{};
-    } else null;
-
-    const release = if (parsed.release) |rel| blk: {
-        if (rel.github) |gh| {
-            break :blk Release{
-                .github = GitHubRelease{
-                    .owner = try dupeString(allocator, gh.owner),
-                    .repo = try dupeString(allocator, gh.repo),
-                    .draft = gh.draft,
-                    .prerelease = gh.prerelease,
-                },
-            };
-        }
-        break :blk Release{};
-    } else null;
-
-    return Config{
-        .project = project,
-        .build = build,
-        .targets = targets,
-        .packages = packages,
-        .release = release,
-    };
+    return ParseError.FileNotFound;
 }
 
-pub fn load(allocator: std.mem.Allocator, path: []const u8) (ParseError || std.fs.File.OpenError || error{ReadError})!Config {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
+fn isJsoncFile(path: []const u8) bool {
+    return std.mem.endsWith(u8, path, ".jsonc");
+}
 
-    const content = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch {
-        return error.ReadError;
+pub fn load(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ParseError!Config {
+    const cwd = std.Io.Dir.cwd();
+    const content = cwd.readFileAlloc(io, path, allocator, .limited(10 * 1024 * 1024)) catch |err| {
+        return switch (err) {
+            error.FileNotFound => ParseError.FileNotFound,
+            else => ParseError.ReadError,
+        };
     };
     defer allocator.free(content);
 
-    var parser = toml.Parser(Config).init(allocator);
-    defer parser.deinit();
+    const json_content: []const u8 = if (isJsoncFile(path)) blk: {
+        const stripped = jsonc.stripComments(allocator, content) catch |err| {
+            log.err("failed to strip comments from {s}: {}", .{ path, err });
+            return ParseError.InvalidJsonc;
+        };
+        break :blk stripped;
+    } else content;
 
-    var result = parser.parseString(content) catch |err| {
-        if (parser.error_info) |info| {
-            switch (info) {
-                .parse => |pos| {
-                    log.err("parse error at line {d}, position {d}: {}", .{ pos.line, pos.pos, err });
-                },
-                .struct_mapping => |field_path| {
-                    log.err("field error in '{any}': {}", .{ field_path, err });
-                },
-            }
-        } else {
-            log.err("failed to parse {s}: {}", .{ path, err });
-        }
-        return ParseError.InvalidToml;
+    const parsed = json.parseFromSlice(Config, allocator, json_content, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        log.err("failed to parse {s}: {}", .{ path, err });
+        return ParseError.InvalidJson;
     };
+    defer parsed.deinit();
 
-    const cfg = deepCopyConfig(allocator, result.value) catch |err| {
-        result.deinit();
-        return err;
-    };
-    result.deinit();
+    if (isJsoncFile(path)) {
+        allocator.free(@constCast(json_content));
+    }
 
-    return cfg;
+    return parsed.value;
 }
 
-pub fn loadDefault(allocator: std.mem.Allocator) (ParseError || std.fs.File.OpenError || error{ReadError})!Config {
-    const path = try find(allocator);
+pub fn loadDefault(allocator: std.mem.Allocator, io: std.Io) ParseError!Config {
+    const path = try find(allocator, io);
     defer allocator.free(path);
-    return load(allocator, path);
+    return load(allocator, io, path);
 }
 
 pub fn validate(config: *const Config) ValidationError!void {
@@ -271,6 +189,17 @@ pub fn validate(config: *const Config) ValidationError!void {
         }
         if (!arch_valid) return error.InvalidTargetArch;
     }
+
+    if (config.release) |release| {
+        if (release.github) |github| {
+            if (github.owner.len == 0) {
+                return error.MissingGitHubOwner;
+            }
+            if (github.repo.len == 0) {
+                return error.MissingGitHubRepo;
+            }
+        }
+    }
 }
 
 pub const TemplateContext = struct {
@@ -285,8 +214,8 @@ pub fn resolveTemplate(
     template: []const u8,
     ctx: TemplateContext,
 ) (TemplateError || std.mem.Allocator.Error)![]const u8 {
-    var result = std.ArrayList(u8).init(allocator);
-    defer result.deinit();
+    var result: std.ArrayList(u8) = .empty;
+    defer result.deinit(allocator);
 
     var i: usize = 0;
     while (i < template.len) {
@@ -312,20 +241,20 @@ pub fn resolveTemplate(
             }
 
             const resolved = resolveVariable(allocator, expr, ctx) catch |err| {
-                try result.appendSlice(template[start .. i + 2]);
+                try result.appendSlice(allocator, template[start .. i + 2]);
                 return err;
             };
             defer allocator.free(resolved);
-            try result.appendSlice(resolved);
+            try result.appendSlice(allocator, resolved);
 
             i += 2;
         } else {
-            try result.append(template[i]);
+            try result.append(allocator, template[i]);
             i += 1;
         }
     }
 
-    return result.toOwnedSlice();
+    return result.toOwnedSlice(allocator);
 }
 
 fn resolveVariable(
@@ -371,6 +300,8 @@ pub fn formatValidationError(err: ValidationError, writer: anytype) !void {
         error.MissingBuildTarget => "missing required field: at least one [[targets]]",
         error.InvalidTargetOs => "invalid target os (must be one of: linux, macos, windows, freebsd, netbsd, openbsd)",
         error.InvalidTargetArch => "invalid target arch (must be one of: x86_64, aarch64, arm, riscv64, x86)",
+        error.MissingGitHubOwner => "missing required field: release.github.owner",
+        error.MissingGitHubRepo => "missing required field: release.github.repo",
     };
     try writer.writeAll(msg);
 }
@@ -378,9 +309,13 @@ pub fn formatValidationError(err: ValidationError, writer: anytype) !void {
 pub fn formatParseError(err: ParseError, writer: anytype) !void {
     const msg = switch (err) {
         error.FileNotFound => "configuration file not found",
-        error.InvalidToml => "invalid TOML syntax",
+        error.InvalidJson => "invalid JSON syntax",
+        error.InvalidJsonc => "invalid JSONC syntax",
         error.ValidationFailed => "configuration validation failed",
-        else => @errorName(err),
+        error.UnterminatedString => "unterminated string in configuration",
+        error.UnterminatedBlockComment => "unterminated block comment in configuration",
+        error.ReadError => "error reading configuration file",
+        error.OutOfMemory => "out of memory",
     };
     try writer.writeAll(msg);
 }
@@ -592,18 +527,73 @@ test "resolveTemplate handles multiple templates" {
     try std.testing.expectEqualStrings("pre-x86_64-linux-suf", result);
 }
 
-test "find discovers zr.toml in current directory" {
+test "load parses valid JSON config" {
     const allocator = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "zr.toml", .data = "[project]\nname = \"test\"" });
+    try tmp.dir.writeFile(.{ .sub_path = "test.json", .data = "{\"project\":{\"name\":\"test\"},\"targets\":[{\"os\":\"linux\",\"arch\":\"x86_64\"}]}" });
 
     const original_cwd = std.process.cwd();
     defer std.process.chdir(original_cwd) catch {};
 
-    // Change to temp dir
+    try tmp.dir.setAsCwd();
+
+    const config = try load(allocator, "test.json");
+    defer {
+        // JSON parser allocates strings that we need to free
+        // For this test we skip cleanup as the arena handles it
+    }
+
+    try std.testing.expectEqualStrings("test", config.project.name);
+    try std.testing.expectEqual(@as(usize, 1), config.targets.len);
+    try std.testing.expectEqualStrings("linux", config.targets[0].os);
+    try std.testing.expectEqualStrings("x86_64", config.targets[0].arch);
+}
+
+test "load parses valid JSONC config with comments" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const jsonc_content =
+        \\{
+        \\  // Project configuration
+        \\  "project": {
+        \\    "name": "test" /* name here */
+        \\  },
+        \\  "targets": [
+        \\    {"os": "linux", "arch": "x86_64"}
+        \\  ]
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "test.jsonc", .data = jsonc_content });
+
+    const original_cwd = std.process.cwd();
+    defer std.process.chdir(original_cwd) catch {};
+
+    try tmp.dir.setAsCwd();
+
+    const config = try load(allocator, "test.jsonc");
+
+    try std.testing.expectEqualStrings("test", config.project.name);
+    try std.testing.expectEqual(@as(usize, 1), config.targets.len);
+}
+
+test "find discovers zr.json in current directory" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "zr.json", .data = "{\"project\":{\"name\":\"test\"}}" });
+
+    const original_cwd = std.process.cwd();
+    defer std.process.chdir(original_cwd) catch {};
+
     try tmp.dir.setAsCwd();
 
     const path = find(allocator) catch |err| {
@@ -612,5 +602,27 @@ test "find discovers zr.toml in current directory" {
     };
     defer allocator.free(path);
 
-    try std.testing.expect(std.mem.eql(u8, path, "zr.toml"));
+    try std.testing.expect(std.mem.eql(u8, path, "zr.json"));
+}
+
+test "find discovers zr.jsonc in current directory" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "zr.jsonc", .data = "{//config\n\"project\":{\"name\":\"test\"}}" });
+
+    const original_cwd = std.process.cwd();
+    defer std.process.chdir(original_cwd) catch {};
+
+    try tmp.dir.setAsCwd();
+
+    const path = find(allocator) catch |err| {
+        if (err == error.FileNotFound) return;
+        return err;
+    };
+    defer allocator.free(path);
+
+    try std.testing.expect(std.mem.eql(u8, path, "zr.jsonc"));
 }

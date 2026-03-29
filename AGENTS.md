@@ -10,7 +10,7 @@
 - `src/packagers/` — one file per package format (.deb, .rpm, etc.)
 - `src/publishers/` — GitHub, AUR, Homebrew tap publishers
 - `build.zig` — the project build file
-- `zr.toml` — zr's own release config (dogfooding)
+- `zr.jsonc` — zr's own release config (dogfooding)
 
 ## Key constraints
 
