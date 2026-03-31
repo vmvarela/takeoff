@@ -90,8 +90,16 @@ pub const ReleaseResult = struct {
 
 /// Client configuration options.
 pub const ClientOptions = struct {
-    /// Timeout for HTTP requests in milliseconds (default: 30 seconds)
+    /// Maximum time to establish the TCP connection in milliseconds (default: 30 seconds).
+    /// Set to 0 to disable the connect timeout.
     timeout_ms: u64 = 30_000,
+    /// Maximum time for an entire request (connect + send + receive + body read) in
+    /// milliseconds.  Set to 0 to disable (default).
+    ///
+    /// When non-zero, a deadline is pinned at the start of each request and applied to
+    /// the connect phase.  Post-connect phases (send/receive/body) will be bounded by
+    /// this deadline once std.http.Client exposes per-request timeout options.
+    request_timeout_ms: u64 = 0,
     /// Maximum response size in bytes (default: 100 MB)
     max_response_size: usize = 100 * 1024 * 1024,
     /// Base URL for GitHub API (default: https://api.github.com)
@@ -110,6 +118,8 @@ pub const GitHubClient = struct {
     base_url: []const u8,
     /// Timeout applied to each TCP connect attempt.
     connect_timeout: std.Io.Timeout,
+    /// Per-request deadline (pinned at request start).  `.none` if disabled.
+    request_timeout: std.Io.Timeout,
     max_response_size: usize,
 
     /// Initialize a new GitHub client with default options.
@@ -139,6 +149,11 @@ pub const GitHubClient = struct {
         else
             .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(@intCast(options.timeout_ms)) } };
 
+        const request_timeout: std.Io.Timeout = if (options.request_timeout_ms == 0)
+            .none
+        else
+            .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(@intCast(options.request_timeout_ms)) } };
+
         return .{
             .allocator = allocator,
             .io = io,
@@ -146,6 +161,7 @@ pub const GitHubClient = struct {
             .token = token_copy,
             .base_url = base_url_copy,
             .connect_timeout = connect_timeout,
+            .request_timeout = request_timeout,
             .max_response_size = options.max_response_size,
         };
     }
@@ -223,12 +239,16 @@ pub const GitHubClient = struct {
     }
 
     /// Pre-connect to the host derived from `uri`, applying the configured
-    /// connect timeout.  Returns the pooled connection, which must be passed
-    /// back to `http_client.request` via `RequestOptions.connection`.
+    /// connect timeout bounded by `request_deadline`.  Returns the pooled
+    /// connection, which must be passed back to `http_client.request` via
+    /// `RequestOptions.connection`.
     fn connectWithTimeout(
         self: *GitHubClient,
         uri: std.Uri,
         protocol: std.http.Client.Protocol,
+        /// Per-request deadline computed at the start of the calling function.
+        /// Use `.none` when no request timeout is configured.
+        request_deadline: std.Io.Timeout,
     ) GitHubError!*std.http.Client.Connection {
         var host_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
         const host_name = uri.getHost(&host_name_buffer) catch |err| {
@@ -239,11 +259,14 @@ pub const GitHubClient = struct {
             .plain => 80,
             .tls => 443,
         };
+        // Use whichever deadline is earlier: the per-connect limit or the
+        // per-request deadline.
+        const effective_timeout = earlierTimeout(self.connect_timeout, request_deadline, self.io);
         return self.http_client.connectTcpOptions(.{
             .host = host_name,
             .port = port,
             .protocol = protocol,
-            .timeout = self.connect_timeout,
+            .timeout = effective_timeout,
         }) catch |err| {
             log.err("failed to connect: {}", .{err});
             return error.NetworkError;
@@ -269,7 +292,11 @@ pub const GitHubClient = struct {
             log.err("unsupported URI scheme", .{});
             return error.NetworkError;
         };
-        const connection = try self.connectWithTimeout(uri, protocol);
+
+        // Pin the per-request deadline NOW so that connect + future send/receive
+        // phases all count against the same budget.
+        const request_deadline = self.request_timeout.toDeadline(self.io);
+        const connection = try self.connectWithTimeout(uri, protocol, request_deadline);
 
         var req = self.http_client.request(method, uri, .{
             .extra_headers = headers,
@@ -662,7 +689,9 @@ pub const GitHubClient = struct {
             log.err("unsupported URI scheme", .{});
             return error.NetworkError;
         };
-        const connection = try self.connectWithTimeout(uri, protocol);
+        // Pin the per-request deadline NOW (same pattern as makeRequestRaw).
+        const request_deadline = self.request_timeout.toDeadline(self.io);
+        const connection = try self.connectWithTimeout(uri, protocol, request_deadline);
 
         var req = self.http_client.request(.POST, uri, .{
             .extra_headers = headers,
@@ -906,6 +935,27 @@ fn copyAssetInfo(allocator: std.mem.Allocator, asset: AssetInfo) GitHubError!Ass
         .content_type = content_type,
         .size = asset.size,
         .browser_download_url = browser_download_url,
+    };
+}
+
+/// Return the earlier of two `std.Io.Timeout` values.
+///
+/// Both inputs are converted to deadline form (relative to `io`'s current
+/// time) so they can be compared on a common scale.  `.none` is treated as
+/// "no deadline" — the other value wins.  When both are `.none`, `.none` is
+/// returned.
+fn earlierTimeout(a: std.Io.Timeout, b: std.Io.Timeout, io: std.Io) std.Io.Timeout {
+    const a_dl = a.toDeadline(io);
+    const b_dl = b.toDeadline(io);
+    return switch (a_dl) {
+        .none => b_dl,
+        .deadline => |ad| switch (b_dl) {
+            .none => a_dl,
+            .deadline => |bd| if (ad.compare(.lt, bd)) a_dl else b_dl,
+            // toDeadline only ever returns .none or .deadline.
+            else => unreachable,
+        },
+        else => unreachable,
     };
 }
 
@@ -1189,6 +1239,60 @@ test "GitHubClient stores max_response_size from options" {
     defer client.deinit();
 
     try std.testing.expectEqual(@as(usize, 1234), client.max_response_size);
+}
+
+test "GitHubClient.initWithOptions request_timeout_ms=0 produces .none request_timeout" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+
+    var client = try GitHubClient.initWithOptions(allocator, io, "tok", .{
+        .request_timeout_ms = 0,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(std.Io.Timeout.none, client.request_timeout);
+}
+
+test "GitHubClient.initWithOptions non-zero request_timeout_ms produces .duration request_timeout" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+
+    var client = try GitHubClient.initWithOptions(allocator, io, "tok", .{
+        .request_timeout_ms = 60_000,
+    });
+    defer client.deinit();
+
+    try std.testing.expect(client.request_timeout != .none);
+}
+
+test "earlierTimeout: both .none returns .none" {
+    const io = std.Options.debug_io;
+    const result = earlierTimeout(.none, .none, io);
+    try std.testing.expectEqual(std.Io.Timeout.none, result);
+}
+
+test "earlierTimeout: one .none returns the other" {
+    const io = std.Options.debug_io;
+    const dur: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(5000) } };
+    try std.testing.expect(earlierTimeout(.none, dur, io) != .none);
+    try std.testing.expect(earlierTimeout(dur, .none, io) != .none);
+}
+
+test "earlierTimeout: returns the smaller deadline" {
+    const io = std.Options.debug_io;
+    const short: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(100) } };
+    const long: std.Io.Timeout = .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(60_000) } };
+    // Both converted to deadline — the shorter one should win.
+    const result = earlierTimeout(short, long, io);
+    // The result must itself be a deadline and must be earlier than the long one.
+    const long_dl = long.toDeadline(io);
+    switch (result) {
+        .deadline => |rd| switch (long_dl) {
+            .deadline => |ld| try std.testing.expect(rd.compare(.lt, ld)),
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "GitHubClient.checkRepoAccess is a method on GitHubClient" {
