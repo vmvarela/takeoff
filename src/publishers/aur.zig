@@ -118,7 +118,7 @@ pub fn publishAurPackage(
 
     const aur_dir = try std.fs.path.join(allocator, &.{ opts.dist_dir, "aur", opts.aur_repo });
     defer allocator.free(aur_dir);
-    try std.Io.Dir.cwd().createDirPath(io, aur_dir);
+    std.Io.Dir.cwd().createDirPath(io, aur_dir) catch return error.WriteError;
 
     const pkgbuild_content = try renderPkgbuild(allocator, md);
     defer allocator.free(pkgbuild_content);
@@ -261,7 +261,7 @@ fn renderPkgbuild(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocat
             "\n" ++
             "package() {{\n" ++
             "  local _bin\n" ++
-            "  _bin=\"$(find \"$srcdir\" -type f -path '*/bin/{s}' -print -quit)\"\n" ++
+            "  _bin=\"$(find \"$srcdir\" -type f -path \"*/bin/{s}\" -print -quit)\"\n" ++
             "  [[ -n \"$_bin\" ]] || {{ echo \"binary not found in source archive\"; return 1; }}\n" ++
             "\n" ++
             "  install -Dm755 \"$_bin\" \"$pkgdir/usr/bin/{s}\"\n" ++
@@ -269,7 +269,7 @@ fn renderPkgbuild(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocat
             "  while IFS= read -r -d '' _f; do\n" ++
             "    local _rel=\"${{_f#*/man/}}\"\n" ++
             "    install -Dm644 \"$_f\" \"$pkgdir/usr/share/man/${{_rel}}\"\n" ++
-            "  done < <(find \"$srcdir\" -type f -path '*/man/*' -print0)\n" ++
+            "  done < <(find \"$srcdir\" -type f -path \"*/man/*\" -print0)\n" ++
             "\n" ++
             "  while IFS= read -r -d '' _f; do\n" ++
             "    if [[ \"$_f\" == */completions/bash/* ]]; then\n" ++
@@ -282,7 +282,7 @@ fn renderPkgbuild(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocat
             "      local _rel=\"${{_f#*/completions/fish/}}\"\n" ++
             "      install -Dm644 \"$_f\" \"$pkgdir/usr/share/fish/vendor_completions.d/${{_rel}}\"\n" ++
             "    fi\n" ++
-            "  done < <(find \"$srcdir\" -type f -path '*/completions/*' -print0)\n" ++
+            "  done < <(find \"$srcdir\" -type f -path \"*/completions/*\" -print0)\n" ++
             "}}\n",
         .{
             md.pkgname,
@@ -370,7 +370,7 @@ fn generateSrcInfoFromPkgbuild(
 fn resolveSshKey(allocator: std.mem.Allocator, configured_key: ?[]const u8) !?[]const u8 {
     if (configured_key) |k| {
         if (k.len == 0) return null;
-        return allocator.dupe(u8, k);
+        return @as(?[]const u8, try allocator.dupe(u8, k));
     }
     const environ = std.Options.debug_threaded_io.?.environ.process_environ;
     return std.process.Environ.getAlloc(environ, allocator, "AUR_SSH_KEY") catch null;
@@ -385,7 +385,7 @@ fn pushToAur(
     srcinfo_path: []const u8,
     pkgver: []const u8,
 ) AurError!bool {
-    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/zr-aur-{d}", .{std.time.milliTimestamp()});
+    const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/zr-aur-{s}-{s}", .{ aur_repo, pkgver });
     defer allocator.free(tmp_dir);
     std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch return error.WriteError;
 
@@ -516,6 +516,7 @@ test "renderPkgbuild includes required install paths" {
     try std.testing.expect(std.mem.indexOf(u8, content, "install -Dm755") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/usr/share/man") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/usr/share/bash-completion/completions") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "-path \"*/bin/mytool\"") != null);
 }
 
 test "renderSrcinfo includes pkgbase and pkgname" {
