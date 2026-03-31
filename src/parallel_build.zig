@@ -406,9 +406,11 @@ test "BuildJob.initFailed creates job with null target" {
 
 test "runParallelBuilds with empty targets" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const summary = try runParallelBuilds(
         allocator,
+        io,
         &.{},
         "test",
         null,
@@ -452,12 +454,12 @@ test "BuildSummary print format" {
         .jobs = jobs,
     };
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try summary.print(buf.writer());
+    try summary.print(&aw.writer);
 
-    const output = buf.items;
+    const output = aw.writer.buffer[0..aw.writer.end];
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Build Summary"));
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Succeeded: 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Failed: 1"));
