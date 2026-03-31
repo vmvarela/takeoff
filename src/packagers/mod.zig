@@ -4,3 +4,4 @@
 //! format to disk without requiring any external tool.
 
 pub const deb = @import("deb.zig");
+pub const rpm = @import("rpm.zig");

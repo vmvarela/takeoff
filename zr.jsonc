@@ -29,6 +29,14 @@
         "deb": {
             "maintainer": "Victor M. Varela <vmvarela@gmail.com>",
             "license": "MIT"
+        },
+        // .rpm packages are generated for Linux targets only
+        "rpm": {
+            "release": "1",
+            "summary": "Release automation for Zig projects",
+            "license": "MIT",
+            "packager": "Victor M. Varela <vmvarela@gmail.com>",
+            "url": "https://github.com/vmvarela/zr"
         }
     },
 
