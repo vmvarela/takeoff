@@ -199,11 +199,18 @@ const PackageWorkerContext = struct {
     cfg: config.Config,
     version: []const u8,
     output_dir: []const u8,
+    /// Parallel view of cfg.targets: null means the build failed, skip packaging.
+    binary_paths: []const ?[]const u8,
     results: []PackageResult,
     allocator_mutex: *std.Io.Mutex,
+    /// Shared atomic index: each worker claims the next target by incrementing this.
+    next_package_index: std.atomic.Value(usize),
 };
 
-/// Generate packages for all targets in parallel.
+/// Generate packages for all targets in parallel, respecting `job_count` concurrency.
+///
+/// `job_count == 0` means "use all available CPUs". Otherwise at most
+/// `job_count` packaging operations run simultaneously.
 pub fn generatePackages(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -213,7 +220,6 @@ pub fn generatePackages(
     output_dir: []const u8,
     job_count: usize,
 ) PackageError!PackageSummary {
-    _ = job_count;
     // Check if packaging is configured
     const pkg_config: ?config.TarballPackage = if (cfg.packages) |p|
         p.tarball
@@ -239,23 +245,9 @@ pub fn generatePackages(
         allocator.free(results);
     }
 
-    var allocator_mutex: std.Io.Mutex = .init;
-    var context = PackageWorkerContext{
-        .allocator = allocator,
-        .io = io,
-        .cfg = cfg,
-        .version = version,
-        .output_dir = output_dir,
-        .results = results,
-        .allocator_mutex = &allocator_mutex,
-    };
-
-    var group: std.Io.Group = .init;
-    defer group.cancel(io);
-
-    // Submit packaging jobs
+    // Pre-populate failure results for targets without a binary (main thread,
+    // no mutex needed). Workers will skip these indices.
     for (cfg.targets, 0..) |target, i| {
-        // Skip targets that didn't build successfully
         if (binary_paths[i] == null) {
             const target_triple = try formatTargetTriple(allocator, target);
             results[i] = PackageResult{
@@ -264,23 +256,37 @@ pub fn generatePackages(
                 .archive_path = null,
                 .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
             };
-            continue;
         }
+    }
 
-        group.concurrent(io, packageWorker, .{ &context, target, binary_paths[i].?, i }) catch {
-            allocator_mutex.lockUncancelable(io);
-            defer allocator_mutex.unlock(io);
-            const target_triple = formatTargetTriple(allocator, target) catch return error.BuildFailed;
-            results[i] = PackageResult{
-                .target = target_triple,
-                .success = false,
-                .archive_path = null,
-                .error_message = std.fmt.allocPrint(
-                    allocator,
-                    "Failed to submit packaging job",
-                    .{},
-                ) catch null,
-            };
+    // Determine number of concurrent workers.
+    // job_count == 0  → one worker per logical CPU (fully parallel)
+    // job_count >= 1  → cap at job_count, never exceeding available targets
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const desired_workers: usize = if (job_count == 0) cpu_count else job_count;
+    const num_workers = @min(desired_workers, cfg.targets.len);
+
+    var allocator_mutex: std.Io.Mutex = .init;
+    var context = PackageWorkerContext{
+        .allocator = allocator,
+        .io = io,
+        .cfg = cfg,
+        .version = version,
+        .output_dir = output_dir,
+        .binary_paths = binary_paths,
+        .results = results,
+        .allocator_mutex = &allocator_mutex,
+        .next_package_index = .init(0),
+    };
+
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+
+    // Launch exactly `num_workers` concurrent workers. Each worker loops,
+    // atomically claiming the next target index, until all targets are consumed.
+    for (0..num_workers) |_| {
+        group.concurrent(io, packageWorkerLoop, .{&context}) catch |err| {
+            log.warn("Failed to spawn packaging worker: {}", .{err});
         };
     }
 
@@ -346,6 +352,21 @@ pub fn generatePackages(
     }
 
     return summary;
+}
+
+/// Worker loop: atomically claims target indices and runs packaging until none remain.
+/// Skips indices whose binary_paths entry is null (pre-populated as failed in main thread).
+fn packageWorkerLoop(context: *PackageWorkerContext) std.Io.Cancelable!void {
+    while (true) {
+        // Claim the next target index atomically.
+        const i = context.next_package_index.fetchAdd(1, .seq_cst);
+        if (i >= context.cfg.targets.len) break;
+
+        // Skip targets that didn't build successfully (result already pre-populated).
+        if (context.binary_paths[i] == null) continue;
+
+        try packageWorker(context, context.cfg.targets[i], context.binary_paths[i].?, i);
+    }
 }
 
 /// Worker function for parallel packaging.
@@ -530,4 +551,71 @@ test "generatePackages with no config returns empty summary" {
 
     try std.testing.expectEqual(@as(usize, 0), summary.total);
     try std.testing.expect(summary.allSucceeded());
+}
+
+test "packageWorkerLoop claims all indices with bounded workers" {
+    // Verify that num_workers < num_targets still processes every target slot.
+    // We use all-null binary_paths so workers skip packaging (pre-populated in
+    // main thread) and just advance the atomic index — giving us a fast,
+    // deterministic test with no I/O.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const targets = [_]config.Target{
+        .{ .os = "linux", .arch = "x86_64", .cpu = null },
+        .{ .os = "linux", .arch = "aarch64", .cpu = null },
+        .{ .os = "macos", .arch = "aarch64", .cpu = null },
+        .{ .os = "windows", .arch = "x86_64", .cpu = null },
+        .{ .os = "linux", .arch = "riscv64", .cpu = null },
+    };
+    const num_targets = targets.len;
+    const job_count = 2; // fewer workers than targets
+
+    // All binary_paths are null → all results pre-populated as failures.
+    const binary_paths = [_]?[]const u8{ null, null, null, null, null };
+
+    var results = try allocator.alloc(PackageResult, num_targets);
+    // Pre-populate as the main thread would (mirrors generatePackages logic).
+    for (targets, 0..) |target, i| {
+        results[i] = PackageResult{
+            .target = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ target.os, target.arch }),
+            .success = false,
+            .archive_path = null,
+            .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
+        };
+    }
+    defer {
+        for (results) |*r| r.deinit(allocator);
+        allocator.free(results);
+    }
+
+    var allocator_mutex: std.Io.Mutex = .init;
+    var ctx = PackageWorkerContext{
+        .allocator = allocator,
+        .io = io,
+        .cfg = .{
+            .project = .{ .name = "test" },
+            .targets = &targets,
+            .packages = null,
+        },
+        .version = "0.0.0",
+        .output_dir = "dist",
+        .binary_paths = &binary_paths,
+        .results = results,
+        .allocator_mutex = &allocator_mutex,
+        .next_package_index = .init(0),
+    };
+
+    // Spawn min(job_count, num_targets) workers — same formula as generatePackages.
+    const num_workers = @min(job_count, num_targets);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..num_workers) |_| {
+        try group.concurrent(io, packageWorkerLoop, .{&ctx});
+    }
+    _ = group.await(io) catch {};
+
+    // All target slots must have been visited: the atomic index must be >= num_targets.
+    const final_index = ctx.next_package_index.load(.seq_cst);
+    try std.testing.expect(final_index >= num_targets);
 }
