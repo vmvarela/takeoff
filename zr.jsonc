@@ -52,6 +52,11 @@
         "github": {
             "owner": "vmvarela",
             "repo": "zr"
+        },
+        "aur": {
+            "repo": "zr-bin"
+            // Optional: path to AUR SSH key for push
+            // "aur_ssh_key": "/home/you/.ssh/aur"
         }
     }
 }

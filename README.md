@@ -56,6 +56,11 @@ Create `zr.jsonc` in your project root:
         "github": {
             "owner": "yourname",
             "repo": "myapp"
+        },
+        "aur": {
+            "repo": "myapp-bin"
+            // Optional, otherwise AUR_SSH_KEY env is used:
+            // "aur_ssh_key": "/home/you/.ssh/aur"
         }
     }
 }
@@ -126,9 +131,15 @@ zr release --draft
 
 # Replace existing assets
 zr release --clean-assets
+
+# Also generate/publish AUR metadata (requires release.aur config)
+zr release --aur
 ```
 
 Requires `GITHUB_TOKEN` environment variable with `repo` scope.
+
+For AUR publishing (`--aur`), configure `release.aur.repo` and optionally
+`release.aur.aur_ssh_key` in `zr.jsonc` (or set `AUR_SSH_KEY` env var).
 
 ### `zr verify`
 
@@ -172,8 +183,8 @@ GoReleaser and cargo-dist are excellent tools for their ecosystems. Use `zr` whe
 
 ## Limitations
 
-- Currently only supports GitHub Releases (other publishers planned)
-- Tarball packaging only (deb, rpm, Homebrew coming)
+- AUR flow currently targets Linux `x86_64` tarball artifacts (`-bin` packages)
+- AUR publish requires SSH access to `aur.archlinux.org`
 - No code signing yet
 - Configuration is JSON/JSONC only (no TOML/YAML)
 
@@ -181,7 +192,7 @@ GoReleaser and cargo-dist are excellent tools for their ecosystems. Use `zr` whe
 
 - Zig 0.16.0 or later
 - `GITHUB_TOKEN` for release publishing
-- Optional: `appimagetool`, `wixl`, `dpkg-deb`, `rpmbuild` for advanced packaging
+- Optional: `appimagetool`, `wixl`, `dpkg-deb`, `rpmbuild`, `apk`, `makepkg`, `namcap`
 
 ## License
 

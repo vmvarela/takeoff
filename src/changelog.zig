@@ -192,6 +192,9 @@ fn isArtifactFile(filename: []const u8) bool {
         ".tar.gz",
         ".tgz",
         ".zip",
+        ".deb",
+        ".rpm",
+        ".apk",
         "-sha256.txt",
         "-blake3.txt",
         "-checksums.txt",
@@ -326,6 +329,9 @@ test "isArtifactFile recognizes artifact extensions" {
     try std.testing.expect(isArtifactFile("package.zip"));
     try std.testing.expect(isArtifactFile("checksums-sha256.txt"));
     try std.testing.expect(isArtifactFile("checksums-blake3.txt"));
+    try std.testing.expect(isArtifactFile("pkg_1.0.0_amd64.deb"));
+    try std.testing.expect(isArtifactFile("pkg-1.0.0-1.x86_64.rpm"));
+    try std.testing.expect(isArtifactFile("pkg-1.0.0-r0.apk"));
     try std.testing.expect(!isArtifactFile("main.zig"));
     try std.testing.expect(!isArtifactFile("README.md"));
 }
