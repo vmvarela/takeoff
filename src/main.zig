@@ -51,6 +51,8 @@ pub const ReleaseOptions = struct {
     dry_run: bool = false,
     /// Delete existing assets before uploading
     clean_assets: bool = false,
+    /// Also publish/update AUR package metadata after GitHub release.
+    aur: bool = false,
     /// Path to dist directory (default: "dist")
     dist_dir: []const u8 = "dist",
     /// Path to CHANGELOG.md (default: "CHANGELOG.md")
@@ -215,6 +217,8 @@ pub const Command = union(enum) {
                     options.dry_run = true;
                 } else if (std.mem.eql(u8, opt, "--clean-assets")) {
                     options.clean_assets = true;
+                } else if (std.mem.eql(u8, opt, "--aur")) {
+                    options.aur = true;
                 } else if (std.mem.eql(u8, opt, "--dist") or std.mem.eql(u8, opt, "-D")) {
                     i += 1;
                     if (i >= args.len) {
@@ -451,6 +455,7 @@ fn executeCheck(allocator: std.mem.Allocator, io: std.Io) u8 {
         "rpmbuild",
         "apk",
         "makepkg",
+        "namcap",
     };
 
     for (optional_tools) |tool| {
@@ -924,10 +929,49 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
         stdout.print("  Draft: {}\n", .{opts.draft}) catch {};
         stdout.print("  Prerelease: {}\n", .{opts.prerelease}) catch {};
         stdout.print("  Clean assets: {}\n", .{opts.clean_assets}) catch {};
+        stdout.print("  Publish AUR: {}\n", .{opts.aur}) catch {};
         stdout.print("\nRelease notes:\n{s}\n\n", .{notes}) catch {};
         stdout.print("Artifacts to upload:\n", .{}) catch {};
         for (artifacts) |artifact| {
             stdout.print("  - {s}\n", .{std.fs.path.basename(artifact)}) catch {};
+        }
+
+        if (opts.aur) {
+            const aur_cfg = if (cfg.release) |rel| rel.aur else null;
+            if (aur_cfg == null) {
+                stdout.print("\nAUR: skipped (release.aur not configured)\n", .{}) catch {};
+            } else {
+                const project_desc = cfg.project.description orelse cfg.project.name;
+                const project_license = cfg.project.license orelse "unknown";
+                const gh_cfg = cfg.release.?.github.?;
+                const aur_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
+                defer if (aur_url.ptr != "".ptr) allocator.free(aur_url);
+
+                const aur_opts = ZigReleaser.publishers.AurPublishOptions{
+                    .aur_repo = aur_cfg.?.repo,
+                    .aur_ssh_key = aur_cfg.?.aur_ssh_key,
+                    .owner = gh_cfg.owner,
+                    .repo = gh_cfg.repo,
+                    .tag = tag,
+                    .project_name = cfg.project.name,
+                    .description = project_desc,
+                    .license = project_license,
+                    .url = aur_url,
+                    .dist_dir = opts.dist_dir,
+                    .dry_run = true,
+                };
+
+                var aur_result = ZigReleaser.publishers.publishAurPackage(allocator, io, aur_opts) catch |err| {
+                    stdout.print("\nAUR dry-run failed: {s}\n", .{@errorName(err)}) catch {};
+                    return 0;
+                };
+                defer aur_result.deinit(allocator);
+
+                stdout.print("\nAUR metadata (dry-run):\n", .{}) catch {};
+                stdout.print("  PKGBUILD: {s}\n", .{aur_result.pkgbuild_path}) catch {};
+                stdout.print("  .SRCINFO: {s}\n", .{aur_result.srcinfo_path}) catch {};
+                stdout.print("  {s}\n", .{aur_result.message}) catch {};
+            }
         }
         return 0;
     }
@@ -963,6 +1007,45 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             stdout.print("   Assets deleted: {d}\n", .{result.deleted_assets}) catch {};
         }
         stdout.print("   Assets uploaded: {d}\n", .{result.uploaded_assets}) catch {};
+
+        if (opts.aur) {
+            const aur_cfg = if (cfg.release) |rel| rel.aur else null;
+            if (aur_cfg == null) {
+                stderr.print("Warning: --aur requested but release.aur is not configured. Skipping AUR publish.\n", .{}) catch {};
+                return 0;
+            }
+
+            const project_desc = cfg.project.description orelse cfg.project.name;
+            const project_license = cfg.project.license orelse "unknown";
+
+            const gh_cfg = cfg.release.?.github.?;
+            const aur_opts = ZigReleaser.publishers.AurPublishOptions{
+                .aur_repo = aur_cfg.?.repo,
+                .aur_ssh_key = aur_cfg.?.aur_ssh_key,
+                .owner = gh_cfg.owner,
+                .repo = gh_cfg.repo,
+                .tag = tag,
+                .project_name = cfg.project.name,
+                .description = project_desc,
+                .license = project_license,
+                .url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "",
+                .dist_dir = opts.dist_dir,
+                .dry_run = false,
+            };
+            defer if (aur_opts.url.ptr != "".ptr) allocator.free(aur_opts.url);
+
+            var aur_result = ZigReleaser.publishers.publishAurPackage(allocator, io, aur_opts) catch |err| {
+                stderr.print("Warning: AUR publish failed: {s}\n", .{@errorName(err)}) catch {};
+                return 0;
+            };
+            defer aur_result.deinit(allocator);
+
+            stdout.print("\n📦 AUR metadata\n", .{}) catch {};
+            stdout.print("   PKGBUILD: {s}\n", .{aur_result.pkgbuild_path}) catch {};
+            stdout.print("   .SRCINFO: {s}\n", .{aur_result.srcinfo_path}) catch {};
+            stdout.print("   Pushed: {}\n", .{aur_result.pushed}) catch {};
+            stdout.print("   {s}\n", .{aur_result.message}) catch {};
+        }
         return 0;
     } else {
         stdout.print("\n⚠️  Release completed with errors:\n", .{}) catch {};
@@ -1014,6 +1097,7 @@ const usage =
     \\  -p, --prerelease Mark as prerelease
     \\      --dry-run    Show what would be done without publishing
     \\      --clean-assets Delete existing assets before uploading
+    \\      --aur        Generate PKGBUILD/.SRCINFO and optionally push to AUR
     \\  -D, --dist DIR   Path to dist directory (default: "dist")
     \\  -c, --changelog  Path to CHANGELOG.md (default: "CHANGELOG.md")
     \\
@@ -1261,6 +1345,18 @@ test "Command.fromArgs parses verify with --dir" {
     switch (cmd) {
         .verify => |opts| {
             try std.testing.expectEqualStrings("dist", opts.base_dir.?);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses release with --aur" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--aur" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.aur);
         },
         else => return error.UnexpectedCommand,
     }

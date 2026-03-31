@@ -22,6 +22,7 @@ pub const ValidationError = error{
     InvalidTargetArch,
     MissingGitHubOwner,
     MissingGitHubRepo,
+    MissingAurRepo,
 };
 
 pub const TemplateError = error{
@@ -136,8 +137,18 @@ pub const GitHubRelease = struct {
     prerelease: bool = false,
 };
 
+/// Configuration for publishing to AUR.
+pub const AurRelease = struct {
+    /// AUR repository name (typically `<project>-bin`).
+    repo: []const u8,
+    /// Optional SSH private key path for pushing to AUR.
+    /// If absent, environment variable `AUR_SSH_KEY` is used.
+    aur_ssh_key: ?[]const u8 = null,
+};
+
 pub const Release = struct {
     github: ?GitHubRelease = null,
+    aur: ?AurRelease = null,
 };
 
 pub const Config = struct {
@@ -252,7 +263,11 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .draft = gh.draft,
             .prerelease = gh.prerelease,
         } else null;
-        break :blk Release{ .github = github };
+        const aur: ?AurRelease = if (rel.aur) |a| AurRelease{
+            .repo = try allocator.dupe(u8, a.repo),
+            .aur_ssh_key = try dupeOptStr(allocator, a.aur_ssh_key),
+        } else null;
+        break :blk Release{ .github = github, .aur = aur };
     } else null;
 
     return Config{
@@ -344,6 +359,11 @@ pub fn validate(config: *const Config) ValidationError!void {
             }
             if (github.repo.len == 0) {
                 return error.MissingGitHubRepo;
+            }
+        }
+        if (release.aur) |aur| {
+            if (aur.repo.len == 0) {
+                return error.MissingAurRepo;
             }
         }
     }
@@ -449,6 +469,7 @@ pub fn formatValidationError(err: ValidationError, writer: anytype) !void {
         error.InvalidTargetArch => "invalid target arch (must be one of: x86_64, aarch64, arm, riscv64, x86)",
         error.MissingGitHubOwner => "missing required field: release.github.owner",
         error.MissingGitHubRepo => "missing required field: release.github.repo",
+        error.MissingAurRepo => "missing required field: release.aur.repo",
     };
     try writer.writeAll(msg);
 }
@@ -790,6 +811,50 @@ test "load parses packages.apk config" {
     try std.testing.expectEqualStrings("Carol <carol@example.com>", a.getMaintainer());
     try std.testing.expectEqualStrings("MIT", a.license.?);
     try std.testing.expectEqualStrings("My Alpine package", a.description.?);
+}
+
+test "validate rejects empty release.aur.repo" {
+    const cfg = Config{
+        .project = .{ .name = "test" },
+        .targets = &[_]Target{.{ .os = "linux", .arch = "x86_64" }},
+        .release = .{ .aur = .{ .repo = "" } },
+    };
+    try std.testing.expectError(error.MissingAurRepo, validate(&cfg));
+}
+
+test "load parses release.aur config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {"name": "mypkg"},
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}],
+        \\  "release": {
+        \\    "aur": {
+        \\      "repo": "mypkg-bin",
+        \\      "aur_ssh_key": "/home/user/.ssh/aur"
+        \\    }
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+    try std.testing.expect(cfg.release != null);
+    try std.testing.expect(cfg.release.?.aur != null);
+    try std.testing.expectEqualStrings("mypkg-bin", cfg.release.?.aur.?.repo);
+    try std.testing.expectEqualStrings("/home/user/.ssh/aur", cfg.release.?.aur.?.aur_ssh_key.?);
 }
 
 test "resolveTemplate handles multiple templates" {
