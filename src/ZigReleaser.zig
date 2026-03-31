@@ -43,7 +43,6 @@ pub const Command = union(enum) {
         if (std.mem.eql(u8, arg, "check"))
             return .check;
 
-        log.err("unknown command: {s}", .{arg});
         return CliError.UnknownCommand;
     }
 };

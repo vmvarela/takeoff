@@ -963,6 +963,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
 
     const result = ZigReleaser.publishers.publishRelease(
         allocator,
+        io,
         release_opts,
         opts.dist_dir,
         asset_names,

@@ -104,39 +104,48 @@ pub const GitHubClient = struct {
     const redirect_buffer_size = 64 * 1024; // 64KB for headers
 
     allocator: std.mem.Allocator,
+    io: std.Io,
     http_client: std.http.Client,
     token: []const u8,
     base_url: []const u8,
-    timeout_ms: u64,
+    /// Timeout applied to each TCP connect attempt.
+    connect_timeout: std.Io.Timeout,
     max_response_size: usize,
 
     /// Initialize a new GitHub client with default options.
     /// Caller owns the returned memory and must call deinit.
-    pub fn init(allocator: std.mem.Allocator, token: []const u8) GitHubError!GitHubClient {
-        return initWithOptions(allocator, token, .{});
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, token: []const u8) GitHubError!GitHubClient {
+        return initWithOptions(allocator, io, token, .{});
     }
 
     /// Initialize a new GitHub client with custom options.
     /// Caller owns the returned memory and must call deinit.
     pub fn initWithOptions(
         allocator: std.mem.Allocator,
+        io: std.Io,
         token: []const u8,
         options: ClientOptions,
     ) GitHubError!GitHubClient {
         const token_copy = try allocator.dupe(u8, token);
         errdefer allocator.free(token_copy);
 
-        const http_client = std.http.Client{ .allocator = allocator, .io = std.Options.debug_io };
+        const http_client = std.http.Client{ .allocator = allocator, .io = io };
 
         const base_url_copy = try allocator.dupe(u8, options.base_url);
         errdefer allocator.free(base_url_copy);
 
+        const connect_timeout: std.Io.Timeout = if (options.timeout_ms == 0)
+            .none
+        else
+            .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(@intCast(options.timeout_ms)) } };
+
         return .{
             .allocator = allocator,
+            .io = io,
             .http_client = http_client,
             .token = token_copy,
             .base_url = base_url_copy,
-            .timeout_ms = options.timeout_ms,
+            .connect_timeout = connect_timeout,
             .max_response_size = options.max_response_size,
         };
     }
@@ -213,6 +222,34 @@ pub const GitHubClient = struct {
         return try self.makeRequestRaw(method, url, body);
     }
 
+    /// Pre-connect to the host derived from `uri`, applying the configured
+    /// connect timeout.  Returns the pooled connection, which must be passed
+    /// back to `http_client.request` via `RequestOptions.connection`.
+    fn connectWithTimeout(
+        self: *GitHubClient,
+        uri: std.Uri,
+        protocol: std.http.Client.Protocol,
+    ) GitHubError!*std.http.Client.Connection {
+        var host_name_buffer: [std.Io.net.HostName.max_len]u8 = undefined;
+        const host_name = uri.getHost(&host_name_buffer) catch |err| {
+            log.err("failed to get host from URI: {}", .{err});
+            return error.NetworkError;
+        };
+        const port: u16 = uri.port orelse switch (protocol) {
+            .plain => 80,
+            .tls => 443,
+        };
+        return self.http_client.connectTcpOptions(.{
+            .host = host_name,
+            .port = port,
+            .protocol = protocol,
+            .timeout = self.connect_timeout,
+        }) catch |err| {
+            log.err("failed to connect: {}", .{err});
+            return error.NetworkError;
+        };
+    }
+
     /// Make a request to a raw URL.
     fn makeRequestRaw(
         self: *GitHubClient,
@@ -228,8 +265,15 @@ pub const GitHubClient = struct {
             return error.ParseError;
         };
 
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse {
+            log.err("unsupported URI scheme", .{});
+            return error.NetworkError;
+        };
+        const connection = try self.connectWithTimeout(uri, protocol);
+
         var req = self.http_client.request(method, uri, .{
             .extra_headers = headers,
+            .connection = connection,
         }) catch |err| {
             log.err("failed to create request: {}", .{err});
             return error.NetworkError;
@@ -527,13 +571,17 @@ pub const GitHubClient = struct {
         // Determine content type
         const content_type = guessContentType(file_name);
 
-        // Read file content
-        const io = std.Options.debug_io;
-        const file_content = std.Io.Dir.cwd().readFileAlloc(io, file_path, self.allocator, .limited(100 * 1024 * 1024)) catch |err| {
-            log.err("failed to read file {s}: {}", .{ file_path, err });
+        // Open the file and get its size for Content-Length without reading it all into memory.
+        const file = std.Io.Dir.cwd().openFile(self.io, file_path, .{}) catch |err| {
+            log.err("failed to open file {s}: {}", .{ file_path, err });
             return error.FileError;
         };
-        defer self.allocator.free(file_content);
+        defer file.close(self.io);
+
+        const file_size = file.length(self.io) catch |err| {
+            log.err("failed to stat file {s}: {}", .{ file_path, err });
+            return error.FileError;
+        };
 
         // Build headers for upload
         var headers = try self.allocator.alloc(std.http.Header, 5);
@@ -548,7 +596,7 @@ pub const GitHubClient = struct {
         headers[3] = .{ .name = "Content-Type", .value = content_type };
         headers[4] = .{
             .name = "Content-Length",
-            .value = try std.fmt.allocPrint(self.allocator, "{d}", .{file_content.len}),
+            .value = try std.fmt.allocPrint(self.allocator, "{d}", .{file_size}),
         };
         defer {
             for (headers) |header| {
@@ -561,8 +609,8 @@ pub const GitHubClient = struct {
             self.allocator.free(headers);
         }
 
-        // Upload
-        const response = self.uploadRaw(upload_url, file_content, headers) catch |err| {
+        // Upload by streaming the file in chunks, avoiding loading it fully into memory.
+        const response = self.uploadStream(upload_url, file, file_size, headers) catch |err| {
             log.err("failed to upload {s}: {}", .{ file_name, err });
             return error.UploadFailed;
         };
@@ -571,7 +619,92 @@ pub const GitHubClient = struct {
         return try parseAssetResponse(self.allocator, response);
     }
 
-    /// Raw upload to a URL.
+    /// Stream a file to a POST upload URL, sending the file contents in chunks
+    /// to avoid loading the entire file into memory.
+    fn uploadStream(
+        self: *GitHubClient,
+        url: []const u8,
+        file: std.Io.File,
+        file_size: u64,
+        headers: []const std.http.Header,
+    ) GitHubError![]const u8 {
+        const uri = std.Uri.parse(url) catch |err| {
+            log.err("failed to parse URL: {}", .{err});
+            return error.ParseError;
+        };
+
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse {
+            log.err("unsupported URI scheme", .{});
+            return error.NetworkError;
+        };
+        const connection = try self.connectWithTimeout(uri, protocol);
+
+        var req = self.http_client.request(.POST, uri, .{
+            .extra_headers = headers,
+            .connection = connection,
+        }) catch |err| {
+            log.err("failed to create request: {}", .{err});
+            return error.NetworkError;
+        };
+        defer req.deinit();
+
+        req.transfer_encoding = .{ .content_length = file_size };
+        var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
+            log.err("failed to start body: {}", .{err});
+            return error.NetworkError;
+        };
+
+        // Stream file contents in 64 KiB chunks.
+        // Use a separate read buffer for the reader's internal state.
+        var read_buf: [65536]u8 = undefined;
+        var chunk: [65536]u8 = undefined;
+        var file_reader = file.reader(self.io, &read_buf);
+        while (true) {
+            const n = file_reader.interface.readSliceShort(&chunk) catch |err| {
+                log.err("failed to read file chunk: {}", .{err});
+                return error.FileError;
+            };
+            if (n == 0) break;
+            body_writer.writer.writeAll(chunk[0..n]) catch |err| {
+                log.err("failed to write body chunk: {}", .{err});
+                return error.NetworkError;
+            };
+        }
+
+        body_writer.end() catch |err| {
+            log.err("failed to end body: {}", .{err});
+            return error.NetworkError;
+        };
+        req.connection.?.flush() catch |err| {
+            log.err("failed to flush: {}", .{err});
+            return error.NetworkError;
+        };
+
+        var redirect_buffer: [redirect_buffer_size]u8 = undefined;
+        var response = req.receiveHead(&redirect_buffer) catch |err| {
+            log.err("failed to receive response: {}", .{err});
+            return error.NetworkError;
+        };
+
+        const status = response.head.status;
+
+        var reader = response.reader(&.{});
+        const response_bytes = reader.allocRemaining(self.allocator, .limited(self.max_response_size)) catch |err| {
+            log.err("failed to read response body: {}", .{err});
+            return error.NetworkError;
+        };
+        errdefer self.allocator.free(response_bytes);
+
+        switch (status) {
+            .ok, .created => return response_bytes,
+            else => {
+                self.allocator.free(response_bytes);
+                return error.UploadFailed;
+            },
+        }
+    }
+
+    /// Raw upload to a URL (in-memory body).
     fn uploadRaw(
         self: *GitHubClient,
         url: []const u8,
@@ -583,8 +716,15 @@ pub const GitHubClient = struct {
             return error.ParseError;
         };
 
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse {
+            log.err("unsupported URI scheme", .{});
+            return error.NetworkError;
+        };
+        const connection = try self.connectWithTimeout(uri, protocol);
+
         var req = self.http_client.request(.POST, uri, .{
             .extra_headers = headers,
+            .connection = connection,
         }) catch |err| {
             log.err("failed to create request: {}", .{err});
             return error.NetworkError;
@@ -969,6 +1109,7 @@ fn guessContentType(filename: []const u8) []const u8 {
 /// This is idempotent - if release exists, it will be updated.
 pub fn publishRelease(
     allocator: std.mem.Allocator,
+    io: std.Io,
     opts: ReleaseOptions,
     artifact_dir: []const u8,
     assets_to_upload: []const []const u8,
@@ -981,7 +1122,7 @@ pub fn publishRelease(
     };
     defer allocator.free(token);
 
-    var client = try GitHubClient.init(allocator, token);
+    var client = try GitHubClient.init(allocator, io, token);
     defer client.deinit();
 
     log.info("checking for existing release {s}", .{opts.tag});
@@ -1031,7 +1172,7 @@ pub fn publishRelease(
         defer allocator.free(full_path);
 
         // Check if file exists
-        std.Io.Dir.cwd().access(std.Options.debug_io, full_path, .{}) catch {
+        std.Io.Dir.cwd().access(io, full_path, .{}) catch {
             const err_msg = try std.fmt.allocPrint(
                 allocator,
                 "File not found: {s}",
@@ -1104,11 +1245,14 @@ test "buildReleaseJson builds valid JSON" {
 }
 
 test "escapeJsonString escapes correctly" {
-    var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
+    const allocator = std.testing.allocator;
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try escapeJsonString(fbs.writer(), "Hello \"World\"\n");
-    try std.testing.expectEqualStrings("Hello \\\"World\\\"\\n", fbs.getWritten());
+    try escapeJsonString(&aw.writer, "Hello \"World\"\n");
+    const result = try aw.toOwnedSlice();
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("Hello \\\"World\\\"\\n", result);
 }
 
 test "unescapeJsonString handles escapes" {
@@ -1161,4 +1305,46 @@ test "parseAssetResponse handles missing optional fields" {
     try std.testing.expectEqualStrings("unknown", asset.name);
     try std.testing.expectEqualStrings("application/octet-stream", asset.content_type);
     try std.testing.expectEqualStrings("", asset.browser_download_url);
+}
+
+test "GitHubClient.initWithOptions stores io and connect_timeout" {
+    // Verify that the io passed in is stored on the client, and that
+    // timeout_ms is converted to a connect_timeout duration (not .none).
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+
+    var client = try GitHubClient.initWithOptions(allocator, io, "test-token", .{
+        .timeout_ms = 5_000,
+    });
+    defer client.deinit();
+
+    // The http_client should use the same io we passed in.
+    try std.testing.expectEqual(io.vtable, client.http_client.io.vtable);
+
+    // A non-zero timeout_ms should produce a .duration timeout, not .none.
+    try std.testing.expect(client.connect_timeout != .none);
+}
+
+test "GitHubClient.initWithOptions zero timeout_ms produces .none connect_timeout" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+
+    var client = try GitHubClient.initWithOptions(allocator, io, "tok", .{
+        .timeout_ms = 0,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(std.Io.Timeout.none, client.connect_timeout);
+}
+
+test "GitHubClient stores max_response_size from options" {
+    const allocator = std.testing.allocator;
+    const io = std.Options.debug_io;
+
+    var client = try GitHubClient.initWithOptions(allocator, io, "tok", .{
+        .max_response_size = 1234,
+    });
+    defer client.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1234), client.max_response_size);
 }
