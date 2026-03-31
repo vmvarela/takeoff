@@ -728,387 +728,185 @@ pub const GitHubClient = struct {
             },
         }
     }
-
-    /// Raw upload to a URL (in-memory body).
-    fn uploadRaw(
-        self: *GitHubClient,
-        url: []const u8,
-        data: []const u8,
-        headers: []const std.http.Header,
-    ) GitHubError![]const u8 {
-        const uri = std.Uri.parse(url) catch |err| {
-            log.err("failed to parse URL: {}", .{err});
-            return error.ParseError;
-        };
-
-        const protocol = std.http.Client.Protocol.fromUri(uri) orelse {
-            log.err("unsupported URI scheme", .{});
-            return error.NetworkError;
-        };
-        const connection = try self.connectWithTimeout(uri, protocol);
-
-        var req = self.http_client.request(.POST, uri, .{
-            .extra_headers = headers,
-            .connection = connection,
-        }) catch |err| {
-            log.err("failed to create request: {}", .{err});
-            return error.NetworkError;
-        };
-        defer req.deinit();
-
-        req.transfer_encoding = .{ .content_length = data.len };
-        var body_writer = req.sendBodyUnflushed(&.{}) catch |err| {
-            log.err("failed to start body: {}", .{err});
-            return error.NetworkError;
-        };
-        body_writer.writer.writeAll(data) catch |err| {
-            log.err("failed to write body: {}", .{err});
-            return error.NetworkError;
-        };
-        body_writer.end() catch |err| {
-            log.err("failed to end body: {}", .{err});
-            return error.NetworkError;
-        };
-        req.connection.?.flush() catch |err| {
-            log.err("failed to flush: {}", .{err});
-            return error.NetworkError;
-        };
-
-        var redirect_buffer: [redirect_buffer_size]u8 = undefined;
-        var response = req.receiveHead(&redirect_buffer) catch |err| {
-            log.err("failed to receive response: {}", .{err});
-            return error.NetworkError;
-        };
-
-        const status = response.head.status;
-
-        var response_body: std.ArrayListUnmanaged(u8) = .empty;
-        defer response_body.deinit(self.allocator);
-
-        var reader = response.reader(&.{});
-        const response_bytes = reader.allocRemaining(self.allocator, .limited(self.max_response_size)) catch |err| {
-            log.err("failed to read response body: {}", .{err});
-            return error.NetworkError;
-        };
-        defer self.allocator.free(response_bytes);
-        response_body.appendSlice(self.allocator, response_bytes) catch {
-            return error.NetworkError;
-        };
-
-        const response_data = try self.allocator.dupe(u8, response_body.items);
-        errdefer self.allocator.free(response_data);
-
-        switch (status) {
-            .ok, .created => return response_data,
-            else => {
-                self.allocator.free(response_data);
-                return error.UploadFailed;
-            },
-        }
-    }
 };
 
-/// Build JSON payload for release create/update.
+/// Typed struct for the GitHub Release API JSON response.
+/// Unknown fields are ignored by the parser.
+const ReleaseApiResponse = struct {
+    id: u64,
+    tag_name: []const u8,
+    name: ?[]const u8 = null,
+    body: ?[]const u8 = null,
+    html_url: ?[]const u8 = null,
+    upload_url: ?[]const u8 = null,
+    draft: bool = false,
+    prerelease: bool = false,
+};
+
+/// Typed struct for a GitHub Release Asset API JSON response.
+const AssetApiResponse = struct {
+    id: u64 = 0,
+    name: ?[]const u8 = null,
+    content_type: ?[]const u8 = null,
+    size: u64 = 0,
+    browser_download_url: ?[]const u8 = null,
+};
+
+/// Payload struct used when serializing a create/update release request body.
+/// Null optional fields are omitted from the JSON output.
+const ReleasePayload = struct {
+    tag_name: []const u8,
+    target_commitish: ?[]const u8 = null,
+    name: ?[]const u8 = null,
+    body: []const u8,
+    draft: bool,
+    prerelease: bool,
+};
+
+/// Build JSON payload for release create/update using std.json.
 fn buildReleaseJson(allocator: std.mem.Allocator, opts: ReleaseOptions) GitHubError![]const u8 {
-    var json: std.ArrayList(u8) = .empty;
-    defer json.deinit(allocator);
-
-    try json.appendSlice(allocator, "{");
-    try json.appendSlice(allocator, "\"tag_name\":\"");
-    try json.appendSlice(allocator, opts.tag);
-    try json.appendSlice(allocator, "\"");
-
-    if (opts.target_commitish) |commit| {
-        try json.appendSlice(allocator, ",\"target_commitish\":\"");
-        try json.appendSlice(allocator, commit);
-        try json.appendSlice(allocator, "\"");
-    }
-
-    if (opts.name) |name| {
-        try json.appendSlice(allocator, ",\"name\":\"");
-        try json.appendSlice(allocator, name);
-        try json.appendSlice(allocator, "\"");
-    }
-
-    try json.appendSlice(allocator, ",\"body\":\"");
-    {
-        var aw: std.Io.Writer.Allocating = .init(allocator);
-        defer aw.deinit();
-        escapeJsonString(&aw.writer, opts.body) catch {
-            return error.ParseError;
-        };
-        const escaped = try aw.toOwnedSlice();
-        defer allocator.free(escaped);
-        try json.appendSlice(allocator, escaped);
-    }
-    try json.appendSlice(allocator, "\"");
-
-    const draft_txt = if (opts.draft) "true" else "false";
-    const prerelease_txt = if (opts.prerelease) "true" else "false";
-    try json.appendSlice(allocator, ",\"draft\":");
-    try json.appendSlice(allocator, draft_txt);
-    try json.appendSlice(allocator, ",\"prerelease\":");
-    try json.appendSlice(allocator, prerelease_txt);
-    try json.appendSlice(allocator, "}");
-
-    return json.toOwnedSlice(allocator);
+    const payload = ReleasePayload{
+        .tag_name = opts.tag,
+        .target_commitish = opts.target_commitish,
+        .name = opts.name,
+        .body = opts.body,
+        .draft = opts.draft,
+        .prerelease = opts.prerelease,
+    };
+    return std.json.Stringify.valueAlloc(allocator, payload, .{
+        .emit_null_optional_fields = false,
+    });
 }
 
-/// Escape a string for JSON.
-fn escapeJsonString(writer: anytype, str: []const u8) !void {
-    for (str) |c| {
-        switch (c) {
-            '"' => try writer.writeAll("\\\""),
-            '\\' => try writer.writeAll("\\\\"),
-            '\n' => try writer.writeAll("\\n"),
-            '\r' => try writer.writeAll("\\r"),
-            '\t' => try writer.writeAll("\\t"),
-            0x08 => try writer.writeAll("\\b"), // backspace
-            0x0C => try writer.writeAll("\\f"), // form feed
-            else => {
-                // Escape control characters
-                if (c < 0x20) {
-                    try writer.print("\\u{x:0>4}", .{c});
-                } else {
-                    try writer.writeByte(c);
-                }
-            },
-        }
-    }
-}
-
-/// Unescape a JSON string (handle escape sequences).
-fn unescapeJsonString(allocator: std.mem.Allocator, input: []const u8) GitHubError![]const u8 {
-    // Check if we need unescaping
-    if (std.mem.indexOfScalar(u8, input, '\\') == null) {
-        return try allocator.dupe(u8, input);
-    }
-
-    var result = std.ArrayListUnmanaged(u8).empty;
-    errdefer result.deinit(allocator);
-
-    var i: usize = 0;
-    while (i < input.len) : (i += 1) {
-        if (input[i] == '\\' and i + 1 < input.len) {
-            const next = input[i + 1];
-            switch (next) {
-                '"' => try result.append(allocator, '"'),
-                '\\' => try result.append(allocator, '\\'),
-                '/' => try result.append(allocator, '/'),
-                'b' => try result.append(allocator, '\x08'),
-                'f' => try result.append(allocator, '\x0c'),
-                'n' => try result.append(allocator, '\n'),
-                'r' => try result.append(allocator, '\r'),
-                't' => try result.append(allocator, '\t'),
-                'u' => {
-                    // Unicode escape: \uXXXX
-                    if (i + 5 < input.len) {
-                        const hex = input[i + 2 .. i + 6];
-                        const codepoint = std.fmt.parseInt(u21, hex, 16) catch 0xFFFD;
-                        var buf: [4]u8 = undefined;
-                        const len = std.unicode.utf8Encode(codepoint, &buf) catch 0;
-                        try result.appendSlice(allocator, buf[0..len]);
-                        i += 4;
-                    }
-                },
-                else => try result.append(allocator, next),
-            }
-            i += 1;
-        } else {
-            try result.append(allocator, input[i]);
-        }
-    }
-
-    return result.toOwnedSlice(allocator);
-}
-
-/// Parse a release JSON response.
+/// Parse a release JSON response into a ReleaseInfo using std.json.
 fn parseReleaseResponse(allocator: std.mem.Allocator, json_data: []const u8) GitHubError!ReleaseInfo {
-    // Simple JSON parsing - extract key fields
-    const id = extractJsonU64(json_data, "\"id\":") orelse {
-        log.err("failed to parse release ID from response", .{});
+    const parsed = std.json.parseFromSlice(ReleaseApiResponse, allocator, json_data, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        log.err("failed to parse release response: {}", .{err});
         return error.ParseError;
     };
+    defer parsed.deinit();
 
-    const tag_name = extractJsonString(allocator, json_data, "\"tag_name\":\"") orelse {
-        log.err("failed to parse tag_name from response", .{});
-        return error.ParseError;
-    };
+    const r = parsed.value;
+
+    const tag_name = try allocator.dupe(u8, r.tag_name);
     errdefer allocator.free(tag_name);
 
-    const name = extractJsonString(allocator, json_data, "\"name\":\"") orelse tag_name;
+    // If name equals tag_name (or is absent), share the tag_name allocation.
+    const name = blk: {
+        const src = r.name orelse r.tag_name;
+        if (std.mem.eql(u8, src, r.tag_name)) break :blk tag_name;
+        const duped = try allocator.dupe(u8, src);
+        break :blk duped;
+    };
     errdefer if (name.ptr != tag_name.ptr) allocator.free(name);
 
-    const body = extractJsonString(allocator, json_data, "\"body\":\"") orelse
-        try allocator.dupe(u8, "");
+    const body = try allocator.dupe(u8, r.body orelse "");
     errdefer allocator.free(body);
 
-    const html_url = extractJsonString(allocator, json_data, "\"html_url\":\"") orelse
-        try allocator.dupe(u8, "");
+    const html_url = try allocator.dupe(u8, r.html_url orelse "");
     errdefer allocator.free(html_url);
 
-    const upload_url = extractJsonString(allocator, json_data, "\"upload_url\":\"") orelse
-        try allocator.dupe(u8, "");
+    const upload_url = try allocator.dupe(u8, r.upload_url orelse "");
     errdefer allocator.free(upload_url);
 
-    // For simplicity, we're not parsing assets in detail here
-    // A full implementation would parse the assets array
-    const assets = try allocator.alloc(AssetInfo, 0);
-
     return .{
-        .id = id,
+        .id = r.id,
         .tag_name = tag_name,
         .name = name,
         .body = body,
-        .draft = std.mem.indexOf(u8, json_data, "\"draft\":true") != null,
-        .prerelease = std.mem.indexOf(u8, json_data, "\"prerelease\":true") != null,
+        .draft = r.draft,
+        .prerelease = r.prerelease,
         .html_url = html_url,
         .upload_url = upload_url,
-        .assets = assets,
+        .assets = try allocator.alloc(AssetInfo, 0),
     };
 }
 
-/// Parse an asset JSON response.
+/// Parse an asset JSON response into an AssetInfo using std.json.
 fn parseAssetResponse(allocator: std.mem.Allocator, json_data: []const u8) GitHubError!AssetInfo {
-    const id = extractJsonU64(json_data, "\"id\":") orelse 0;
+    const parsed = std.json.parseFromSlice(AssetApiResponse, allocator, json_data, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        log.err("failed to parse asset response: {}", .{err});
+        return error.ParseError;
+    };
+    defer parsed.deinit();
 
-    const name = extractJsonString(allocator, json_data, "\"name\":\"") orelse
-        try allocator.dupe(u8, "unknown");
+    const a = parsed.value;
+
+    const name = try allocator.dupe(u8, a.name orelse "unknown");
     errdefer allocator.free(name);
 
-    const content_type = extractJsonString(allocator, json_data, "\"content_type\":\"") orelse
-        try allocator.dupe(u8, "application/octet-stream");
+    const content_type = try allocator.dupe(u8, a.content_type orelse "application/octet-stream");
     errdefer allocator.free(content_type);
 
-    const browser_download_url = extractJsonString(allocator, json_data, "\"browser_download_url\":\"") orelse
-        try allocator.dupe(u8, "");
+    const browser_download_url = try allocator.dupe(u8, a.browser_download_url orelse "");
     errdefer allocator.free(browser_download_url);
 
-    const size = extractJsonU64(json_data, "\"size\":") orelse 0;
-
     return .{
-        .id = id,
+        .id = a.id,
         .name = name,
         .content_type = content_type,
-        .size = @intCast(size),
+        .size = @intCast(a.size),
         .browser_download_url = browser_download_url,
     };
 }
 
-/// Parse an array of assets from JSON response.
+/// Parse a JSON array of assets into a slice of AssetInfo using std.json.
 fn parseAssetsArray(allocator: std.mem.Allocator, json_data: []const u8) GitHubError![]AssetInfo {
-    // Expecting JSON array: [{...}, {...}]
+    const parsed = std.json.parseFromSlice([]AssetApiResponse, allocator, json_data, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        log.err("failed to parse assets array: {}", .{err});
+        return error.ParseError;
+    };
+    defer parsed.deinit();
+
     var assets = std.ArrayListUnmanaged(AssetInfo).empty;
     errdefer {
         for (assets.items) |*asset| asset.deinit(allocator);
         assets.deinit(allocator);
     }
 
-    // Simple parsing: find each object in the array
-    var pos: usize = 0;
-    while (pos < json_data.len) {
-        // Find start of object
-        const obj_start = std.mem.indexOfScalarPos(u8, json_data, pos, '{') orelse break;
+    for (parsed.value) |a| {
+        const name = try allocator.dupe(u8, a.name orelse "unknown");
+        errdefer allocator.free(name);
+        const content_type = try allocator.dupe(u8, a.content_type orelse "application/octet-stream");
+        errdefer allocator.free(content_type);
+        const browser_download_url = try allocator.dupe(u8, a.browser_download_url orelse "");
+        errdefer allocator.free(browser_download_url);
 
-        // Find matching end of object (simple approach)
-        var depth: usize = 1;
-        var obj_end = obj_start + 1;
-        while (obj_end < json_data.len and depth > 0) : (obj_end += 1) {
-            switch (json_data[obj_end]) {
-                '{' => depth += 1,
-                '}' => depth -= 1,
-                '"' => {
-                    // Skip string
-                    var i = obj_end + 1;
-                    while (i < json_data.len) : (i += 1) {
-                        if (json_data[i] == '"' and json_data[i - 1] != '\\') break;
-                    }
-                    obj_end = i;
-                },
-                else => {},
-            }
-        }
-
-        if (depth != 0) break;
-
-        const obj_json = json_data[obj_start..obj_end];
-        const asset = try parseAssetResponse(allocator, obj_json);
-        try assets.append(allocator, asset);
-
-        pos = obj_end;
+        try assets.append(allocator, .{
+            .id = a.id,
+            .name = name,
+            .content_type = content_type,
+            .size = @intCast(a.size),
+            .browser_download_url = browser_download_url,
+        });
     }
 
     return assets.toOwnedSlice(allocator);
 }
 
-/// Copy an AssetInfo struct.
+/// Copy an AssetInfo struct (deep copy — all strings are duplicated).
 fn copyAssetInfo(allocator: std.mem.Allocator, asset: AssetInfo) GitHubError!AssetInfo {
+    const name = try allocator.dupe(u8, asset.name);
+    errdefer allocator.free(name);
+    const content_type = try allocator.dupe(u8, asset.content_type);
+    errdefer allocator.free(content_type);
+    const browser_download_url = try allocator.dupe(u8, asset.browser_download_url);
     return .{
         .id = asset.id,
-        .name = try allocator.dupe(u8, asset.name),
-        .content_type = try allocator.dupe(u8, asset.content_type),
+        .name = name,
+        .content_type = content_type,
         .size = asset.size,
-        .browser_download_url = try allocator.dupe(u8, asset.browser_download_url),
+        .browser_download_url = browser_download_url,
     };
-}
-
-/// Extract a string value from JSON with proper escape handling.
-fn extractJsonString(
-    allocator: std.mem.Allocator,
-    json: []const u8,
-    key: []const u8,
-) ?[]const u8 {
-    const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
-    const start = key_pos + key.len;
-    if (start >= json.len) return null;
-
-    // Check for null value
-    const after_key = std.mem.trimStart(u8, json[start..], " \t\n\r");
-    if (std.mem.startsWith(u8, after_key, "null")) {
-        return allocator.dupe(u8, "") catch null;
-    }
-
-    // Find end of string (handling escaped quotes)
-    var end = start;
-    var escaped = false;
-    while (end < json.len) : (end += 1) {
-        if (escaped) {
-            escaped = false;
-            continue;
-        }
-        if (json[end] == '\\') {
-            escaped = true;
-            continue;
-        }
-        if (json[end] == '"') break;
-    }
-
-    if (end >= json.len) return null;
-
-    // Extract and unescape
-    const raw = json[start..end];
-    return unescapeJsonString(allocator, raw) catch null;
-}
-
-/// Extract a u64 value from JSON.
-fn extractJsonU64(json: []const u8, key: []const u8) ?u64 {
-    const key_pos = std.mem.indexOf(u8, json, key) orelse return null;
-    const start = key_pos + key.len;
-    if (start >= json.len) return null;
-
-    // Skip whitespace
-    var pos = start;
-    while (pos < json.len and (json[pos] == ' ' or json[pos] == '\n' or json[pos] == '\r' or json[pos] == '\t')) : (pos += 1) {}
-
-    if (pos >= json.len) return null;
-
-    // Read number
-    var end = pos;
-    while (end < json.len and std.ascii.isDigit(json[end])) : (end += 1) {}
-
-    if (end == pos) return null;
-
-    return std.fmt.parseInt(u64, json[pos..end], 10) catch null;
 }
 
 /// Guess content type from file extension.
@@ -1269,35 +1067,6 @@ test "buildReleaseJson builds valid JSON" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"prerelease\":false") != null);
 }
 
-test "escapeJsonString escapes correctly" {
-    const allocator = std.testing.allocator;
-    var aw: std.Io.Writer.Allocating = .init(allocator);
-    defer aw.deinit();
-
-    try escapeJsonString(&aw.writer, "Hello \"World\"\n");
-    const result = try aw.toOwnedSlice();
-    defer allocator.free(result);
-    try std.testing.expectEqualStrings("Hello \\\"World\\\"\\n", result);
-}
-
-test "unescapeJsonString handles escapes" {
-    const allocator = std.testing.allocator;
-
-    const unescaped = try unescapeJsonString(allocator, "Hello\\nWorld\\t!");
-    defer allocator.free(unescaped);
-
-    try std.testing.expectEqualStrings("Hello\nWorld\t!", unescaped);
-}
-
-test "unescapeJsonString handles unicode" {
-    const allocator = std.testing.allocator;
-
-    const unescaped = try unescapeJsonString(allocator, "\\u0048\\u0065\\u006c\\u006c\\u006f");
-    defer allocator.free(unescaped);
-
-    try std.testing.expectEqualStrings("Hello", unescaped);
-}
-
 test "parseReleaseResponse handles missing optional fields" {
     const allocator = std.testing.allocator;
 
@@ -1330,6 +1099,54 @@ test "parseAssetResponse handles missing optional fields" {
     try std.testing.expectEqualStrings("unknown", asset.name);
     try std.testing.expectEqualStrings("application/octet-stream", asset.content_type);
     try std.testing.expectEqualStrings("", asset.browser_download_url);
+}
+
+test "parseReleaseResponse parses all fields correctly" {
+    const allocator = std.testing.allocator;
+
+    const json_data =
+        \\{"id":42,"tag_name":"v2.0.0","name":"Version 2","body":"Some notes","draft":true,"prerelease":true,"html_url":"https://github.com/o/r/releases/tag/v2.0.0","upload_url":"https://uploads.github.com/repos/o/r/releases/42/assets{?name,label}"}
+    ;
+
+    var release = try parseReleaseResponse(allocator, json_data);
+    defer release.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u64, 42), release.id);
+    try std.testing.expectEqualStrings("v2.0.0", release.tag_name);
+    try std.testing.expectEqualStrings("Version 2", release.name);
+    try std.testing.expectEqualStrings("Some notes", release.body);
+    try std.testing.expect(release.draft);
+    try std.testing.expect(release.prerelease);
+    try std.testing.expectEqualStrings("https://github.com/o/r/releases/tag/v2.0.0", release.html_url);
+}
+
+test "parseAssetsArray parses multiple assets" {
+    const allocator = std.testing.allocator;
+
+    const json_data =
+        \\[{"id":1,"name":"foo.tar.gz","content_type":"application/gzip","size":1234,"browser_download_url":"https://example.com/foo.tar.gz"},{"id":2,"name":"bar.zip","content_type":"application/zip","size":5678,"browser_download_url":"https://example.com/bar.zip"}]
+    ;
+
+    const assets = try parseAssetsArray(allocator, json_data);
+    defer {
+        for (assets) |*a| a.deinit(allocator);
+        allocator.free(assets);
+    }
+
+    try std.testing.expectEqual(@as(usize, 2), assets.len);
+    try std.testing.expectEqual(@as(u64, 1), assets[0].id);
+    try std.testing.expectEqualStrings("foo.tar.gz", assets[0].name);
+    try std.testing.expectEqualStrings("application/gzip", assets[0].content_type);
+    try std.testing.expectEqual(@as(usize, 1234), assets[0].size);
+    try std.testing.expectEqual(@as(u64, 2), assets[1].id);
+    try std.testing.expectEqualStrings("bar.zip", assets[1].name);
+}
+
+test "parseAssetsArray returns empty slice for empty array" {
+    const allocator = std.testing.allocator;
+    const assets = try parseAssetsArray(allocator, "[]");
+    defer allocator.free(assets);
+    try std.testing.expectEqual(@as(usize, 0), assets.len);
 }
 
 test "GitHubClient.initWithOptions stores io and connect_timeout" {
