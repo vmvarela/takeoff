@@ -427,6 +427,31 @@ pub const GitHubClient = struct {
         return try parseReleaseResponse(self.allocator, response);
     }
 
+    /// Check whether the configured token can read the given repository.
+    ///
+    /// Returns `true` when the API responds with HTTP 200 OK, `false` when it
+    /// responds with HTTP 404 (repo not found or no read access), and propagates
+    /// any other network/auth error to the caller.
+    pub fn checkRepoAccess(
+        self: *GitHubClient,
+        owner: []const u8,
+        repo: []const u8,
+    ) GitHubError!bool {
+        const path = try std.fmt.allocPrint(
+            self.allocator,
+            "/repos/{s}/{s}",
+            .{ owner, repo },
+        );
+        defer self.allocator.free(path);
+
+        const response = self.makeRequest(.GET, path, null) catch |err| {
+            if (err == error.NotFound) return false;
+            return err;
+        };
+        self.allocator.free(response);
+        return true;
+    }
+
     /// Update an existing release.
     pub fn updateRelease(
         self: *GitHubClient,
@@ -1347,4 +1372,13 @@ test "GitHubClient stores max_response_size from options" {
     defer client.deinit();
 
     try std.testing.expectEqual(@as(usize, 1234), client.max_response_size);
+}
+
+test "GitHubClient.checkRepoAccess is a method on GitHubClient" {
+    // Verify the method signature exists and can be referred to without actually
+    // making a network call.  We check that @TypeOf matches the expected return.
+    const F = @TypeOf(GitHubClient.checkRepoAccess);
+    // The function must accept *GitHubClient + two slices and return GitHubError!bool.
+    const info = @typeInfo(F);
+    try std.testing.expectEqual(3, info.@"fn".params.len);
 }

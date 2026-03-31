@@ -516,52 +516,34 @@ fn checkGitHubToken(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config
         return .{ .ok = true, .result = .{ .state = .warn, .message = "GITHUB_TOKEN set (repo permission check skipped: no release.github config)" } };
     }
 
-    var client = std.http.Client{ .allocator = allocator, .io = io };
+    // Use GitHubClient so the token check shares the same Io and benefits from
+    // the configured connect timeout — no raw std.http.Client inline.
+    var client = ZigReleaser.publishers.GitHubClient.initWithOptions(
+        allocator,
+        io,
+        token,
+        .{ .timeout_ms = 30_000 },
+    ) catch {
+        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to initialise GitHub client" } };
+    };
     defer client.deinit();
 
-    const url = std.fmt.allocPrint(allocator, "https://api.github.com/repos/{s}/{s}", .{ owner, repo }) catch {
-        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to build GitHub API URL" } };
-    };
-    defer allocator.free(url);
-
-    const auth_value = std.fmt.allocPrint(allocator, "Bearer {s}", .{token}) catch {
-        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to build auth header" } };
-    };
-    defer allocator.free(auth_value);
-
-    const headers = [_]std.http.Header{
-        .{ .name = "Accept", .value = "application/vnd.github+json" },
-        .{ .name = "Authorization", .value = auth_value },
-        .{ .name = "X-GitHub-Api-Version", .value = "2022-11-28" },
+    const ok = client.checkRepoAccess(owner, repo) catch |err| {
+        const msg = switch (err) {
+            error.AuthenticationFailed => "GITHUB_TOKEN is invalid or lacks repo access",
+            error.RateLimited => "GITHUB_TOKEN check rate-limited by GitHub API",
+            error.NetworkError, error.Timeout => "failed to connect to GitHub API",
+            else => "GitHub API check failed",
+        };
+        return .{ .ok = false, .result = .{ .state = .fail, .message = msg } };
     };
 
-    const uri = std.Uri.parse(url) catch {
-        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to parse GitHub API URL" } };
-    };
-    var req = client.request(.GET, uri, .{ .extra_headers = &headers }) catch {
-        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to connect to GitHub API" } };
-    };
-    defer req.deinit();
-
-    req.sendBodiless() catch {
-        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to send GitHub API request" } };
-    };
-
-    var redirect_buffer: [16 * 1024]u8 = undefined;
-    var response = req.receiveHead(&redirect_buffer) catch {
-        return .{ .ok = false, .result = .{ .state = .fail, .message = "failed to read GitHub API response" } };
-    };
-
-    const body = response.reader(&.{}).allocRemaining(allocator, .limited(16 * 1024)) catch "";
-    defer allocator.free(body);
-
-    const status = response.head.status;
-    if (status == .ok) {
+    if (ok) {
         const msg = std.fmt.allocPrint(allocator, "GITHUB_TOKEN OK: can access {s}/{s}", .{ owner, repo }) catch "GITHUB_TOKEN OK";
         return .{ .ok = true, .result = .{ .state = .pass, .message = msg } };
     }
 
-    const msg = std.fmt.allocPrint(allocator, "GITHUB_TOKEN rejected for {s}/{s} (status {d})", .{ owner, repo, @intFromEnum(status) }) catch "GITHUB_TOKEN rejected";
+    const msg = std.fmt.allocPrint(allocator, "GITHUB_TOKEN rejected for {s}/{s}", .{ owner, repo }) catch "GITHUB_TOKEN rejected";
     return .{ .ok = false, .result = .{ .state = .fail, .message = msg } };
 }
 
