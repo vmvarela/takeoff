@@ -337,9 +337,9 @@ pub fn verifyFile(
     defer allocator.free(computed_hash);
 
     if (!std.mem.eql(u8, computed_hash, expected_hash)) {
-        log.err("checksum mismatch for {s}:", .{filename});
-        log.err("  expected: {s}", .{expected_hash});
-        log.err("  computed: {s}", .{computed_hash});
+        log.warn("checksum mismatch for {s}:", .{filename});
+        log.warn("  expected: {s}", .{expected_hash});
+        log.warn("  computed: {s}", .{computed_hash});
         return ChecksumError.ChecksumMismatch;
     }
 
@@ -379,7 +379,7 @@ pub fn verifyChecksumFile(
             parsed.hash,
             algorithm,
         ) catch |err| {
-            log.err("line {d}: failed to verify {s}", .{ line_no, parsed.filename });
+            log.warn("line {d}: failed to verify {s}", .{ line_no, parsed.filename });
             return err;
         };
 
