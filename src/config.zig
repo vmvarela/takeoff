@@ -277,7 +277,7 @@ pub fn validate(config: *const Config) ValidationError!void {
 }
 
 pub const TemplateContext = struct {
-    env_map: *const std.process.EnvMap,
+    env_map: *const std.BufMap,
     git_tag: ?[]const u8 = null,
     target: ?[]const u8 = null,
     ext: ?[]const u8 = null,
@@ -460,7 +460,7 @@ test "validate rejects invalid arch" {
 test "resolveTemplate handles env variables" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     try env_map.put("TEST_VAR", "test_value");
@@ -478,7 +478,7 @@ test "resolveTemplate handles env variables" {
 test "resolveTemplate handles git.tag" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     const ctx = TemplateContext{
@@ -495,7 +495,7 @@ test "resolveTemplate handles git.tag" {
 test "resolveTemplate handles target" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     const ctx = TemplateContext{
@@ -512,7 +512,7 @@ test "resolveTemplate handles target" {
 test "resolveTemplate handles ext" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     const ctx = TemplateContext{
@@ -529,7 +529,7 @@ test "resolveTemplate handles ext" {
 test "resolveTemplate returns empty for unset env" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     const ctx = TemplateContext{
@@ -545,7 +545,7 @@ test "resolveTemplate returns empty for unset env" {
 test "resolveTemplate returns error for unknown variable" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     const ctx = TemplateContext{
@@ -558,7 +558,7 @@ test "resolveTemplate returns error for unknown variable" {
 test "resolveTemplate returns error for unterminated expression" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     const ctx = TemplateContext{
@@ -571,7 +571,7 @@ test "resolveTemplate returns error for unterminated expression" {
 test "resolveTemplate returns error for empty expression" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     const ctx = TemplateContext{
@@ -584,7 +584,7 @@ test "resolveTemplate returns error for empty expression" {
 test "resolveTemplate handles multiple templates" {
     const allocator = std.testing.allocator;
 
-    var env_map = std.process.EnvMap.init(allocator);
+    var env_map = std.BufMap.init(allocator);
     defer env_map.deinit();
 
     try env_map.put("PREFIX", "pre");
@@ -602,23 +602,22 @@ test "resolveTemplate handles multiple templates" {
 }
 
 test "load parses valid JSON config" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "test.json", .data = "{\"project\":{\"name\":\"test\"},\"targets\":[{\"os\":\"linux\",\"arch\":\"x86_64\"}]}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = "{\"project\":{\"name\":\"test\"},\"targets\":[{\"os\":\"linux\",\"arch\":\"x86_64\"}]}" });
 
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
-    try tmp.dir.setAsCwd();
-
-    const config = try load(allocator, "test.json");
-    defer {
-        // JSON parser allocates strings that we need to free
-        // For this test we skip cleanup as the arena handles it
-    }
+    const config = try load(allocator, io, "test.json");
 
     try std.testing.expectEqualStrings("test", config.project.name);
     try std.testing.expectEqual(@as(usize, 1), config.targets.len);
@@ -627,7 +626,10 @@ test "load parses valid JSON config" {
 }
 
 test "load parses valid JSONC config with comments" {
-    const allocator = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -644,14 +646,14 @@ test "load parses valid JSONC config with comments" {
         \\}
     ;
 
-    try tmp.dir.writeFile(.{ .sub_path = "test.jsonc", .data = jsonc_content });
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.jsonc", .data = jsonc_content });
 
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
-    try tmp.dir.setAsCwd();
-
-    const config = try load(allocator, "test.jsonc");
+    const config = try load(allocator, io, "test.jsonc");
 
     try std.testing.expectEqualStrings("test", config.project.name);
     try std.testing.expectEqual(@as(usize, 1), config.targets.len);
@@ -659,18 +661,19 @@ test "load parses valid JSONC config with comments" {
 
 test "find discovers zr.json in current directory" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "zr.json", .data = "{\"project\":{\"name\":\"test\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "zr.json", .data = "{\"project\":{\"name\":\"test\"}}" });
 
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
-    try tmp.dir.setAsCwd();
-
-    const path = find(allocator) catch |err| {
+    const path = find(allocator, io) catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
@@ -681,18 +684,19 @@ test "find discovers zr.json in current directory" {
 
 test "find discovers zr.jsonc in current directory" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(.{ .sub_path = "zr.jsonc", .data = "{//config\n\"project\":{\"name\":\"test\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "zr.jsonc", .data = "{//config\n\"project\":{\"name\":\"test\"}}" });
 
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
-    try tmp.dir.setAsCwd();
-
-    const path = find(allocator) catch |err| {
+    const path = find(allocator, io) catch |err| {
         if (err == error.FileNotFound) return;
         return err;
     };
