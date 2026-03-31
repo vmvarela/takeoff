@@ -82,6 +82,22 @@ pub const DebPackage = struct {
     }
 };
 
+/// Configuration for generating `.apk` packages (Alpine Linux).
+pub const ApkPackage = struct {
+    /// One-line package description (pkgdesc field).
+    description: ?[]const u8 = null,
+    /// SPDX license identifier.
+    license: ?[]const u8 = null,
+    /// Maintainer field — "Full Name <email@example.com>".
+    maintainer: ?[]const u8 = null,
+    /// URL for the project's home page.
+    url: ?[]const u8 = null,
+
+    pub fn getMaintainer(self: @This()) []const u8 {
+        return self.maintainer orelse "Unknown <unknown@example.com>";
+    }
+};
+
 /// Configuration for generating `.rpm` packages (Fedora/RHEL/openSUSE).
 pub const RpmPackage = struct {
     /// RPM release string (e.g. "1"). Defaults to "1".
@@ -110,6 +126,7 @@ pub const Packages = struct {
     tarball: ?TarballPackage = null,
     deb: ?DebPackage = null,
     rpm: ?RpmPackage = null,
+    apk: ?ApkPackage = null,
 };
 
 pub const GitHubRelease = struct {
@@ -219,7 +236,13 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .packager = try dupeOptStr(allocator, r.packager),
             .url = try dupeOptStr(allocator, r.url),
         } else null;
-        break :blk Packages{ .tarball = tarball, .deb = deb, .rpm = rpm };
+        const apk: ?ApkPackage = if (pkg.apk) |a| ApkPackage{
+            .description = try dupeOptStr(allocator, a.description),
+            .license = try dupeOptStr(allocator, a.license),
+            .maintainer = try dupeOptStr(allocator, a.maintainer),
+            .url = try dupeOptStr(allocator, a.url),
+        } else null;
+        break :blk Packages{ .tarball = tarball, .deb = deb, .rpm = rpm, .apk = apk };
     } else null;
 
     const release: ?Release = if (src.release) |rel| blk: {
@@ -722,6 +745,51 @@ test "resolveTemplate returns error for empty expression" {
     };
 
     try std.testing.expectError(error.EmptyExpression, resolveTemplate(allocator, "{{}}", ctx));
+}
+
+test "ApkPackage getMaintainer returns default when nil" {
+    const a = ApkPackage{};
+    try std.testing.expectEqualStrings("Unknown <unknown@example.com>", a.getMaintainer());
+}
+
+test "load parses packages.apk config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {"name": "mypkg"},
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}],
+        \\  "packages": {
+        \\    "apk": {
+        \\      "description": "My Alpine package",
+        \\      "license": "MIT",
+        \\      "maintainer": "Carol <carol@example.com>",
+        \\      "url": "https://example.com"
+        \\    }
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+
+    try std.testing.expect(cfg.packages != null);
+    try std.testing.expect(cfg.packages.?.apk != null);
+    const a = cfg.packages.?.apk.?;
+    try std.testing.expectEqualStrings("Carol <carol@example.com>", a.getMaintainer());
+    try std.testing.expectEqualStrings("MIT", a.license.?);
+    try std.testing.expectEqualStrings("My Alpine package", a.description.?);
 }
 
 test "resolveTemplate handles multiple templates" {

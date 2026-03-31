@@ -22,6 +22,8 @@ pub const PackageResult = struct {
     deb_path: ?[]const u8,
     /// Path to the generated `.rpm` package, if one was produced.
     rpm_path: ?[]const u8,
+    /// Path to the generated `.apk` package, if one was produced.
+    apk_path: ?[]const u8,
     error_message: ?[]const u8,
 
     pub fn deinit(self: *PackageResult, allocator: std.mem.Allocator) void {
@@ -29,6 +31,7 @@ pub const PackageResult = struct {
         if (self.archive_path) |p| allocator.free(p);
         if (self.deb_path) |p| allocator.free(p);
         if (self.rpm_path) |p| allocator.free(p);
+        if (self.apk_path) |p| allocator.free(p);
         if (self.error_message) |m| allocator.free(m);
     }
 };
@@ -60,6 +63,9 @@ pub const PackageSummary = struct {
                     try writer.print("   → {s}\n", .{path});
                 }
                 if (result.rpm_path) |path| {
+                    try writer.print("   → {s}\n", .{path});
+                }
+                if (result.apk_path) |path| {
                     try writer.print("   → {s}\n", .{path});
                 }
             } else {
@@ -116,6 +122,7 @@ fn packageTarget(
     pkg_config: ?config.TarballPackage,
     deb_config: ?config.DebPackage,
     rpm_config: ?config.RpmPackage,
+    apk_config: ?config.ApkPackage,
 ) PackageError!PackageResult {
     const target_triple = try formatTargetTriple(allocator, target);
     errdefer allocator.free(target_triple);
@@ -148,6 +155,7 @@ fn packageTarget(
             .archive_path = null,
             .deb_path = null,
             .rpm_path = null,
+            .apk_path = null,
             .error_message = error_msg,
         };
     };
@@ -193,6 +201,7 @@ fn packageTarget(
             .archive_path = null,
             .deb_path = null,
             .rpm_path = null,
+            .apk_path = null,
             .error_message = error_copy,
         };
     }
@@ -232,12 +241,28 @@ fn packageTarget(
         );
     }
 
+    // Generate a .apk package for Linux targets when apk config is present.
+    var apk_path_copy: ?[]const u8 = null;
+    if (apk_config != null and std.mem.eql(u8, target.os, "linux")) {
+        apk_path_copy = try packageTargetApk(
+            allocator,
+            io,
+            target,
+            binary_path,
+            project_name,
+            version,
+            output_dir,
+            apk_config.?,
+        );
+    }
+
     return PackageResult{
         .target = target_triple,
         .success = true,
         .archive_path = path_copy,
         .deb_path = deb_path_copy,
         .rpm_path = rpm_path_copy,
+        .apk_path = apk_path_copy,
         .error_message = null,
     };
 }
@@ -336,6 +361,57 @@ fn packageTargetRpm(
     return rpm_output;
 }
 
+/// Generate a `.apk` package for a single Linux target.
+///
+/// Returns the output path on success, or null if generation failed (error is
+/// logged but does not abort the tarball packaging result).
+fn packageTargetApk(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: config.Target,
+    binary_path: []const u8,
+    project_name: []const u8,
+    version: []const u8,
+    output_dir: []const u8,
+    apk_cfg: config.ApkPackage,
+) !?[]const u8 {
+    const apk_arch = packagers.apk.apkArch(target.arch);
+    // APK version strings conventionally include a release suffix like "-r0".
+    const apk_version = try std.fmt.allocPrint(allocator, "{s}-r0", .{version});
+    defer allocator.free(apk_version);
+
+    const apk_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}-{s}.apk",
+        .{ project_name, apk_version },
+    );
+    defer allocator.free(apk_name);
+
+    const apk_output = try std.fs.path.join(allocator, &.{ output_dir, apk_name });
+    errdefer allocator.free(apk_output);
+
+    const apk_gen_cfg = packagers.apk.ApkConfig{
+        .name = project_name,
+        .version = apk_version,
+        .arch = apk_arch,
+        .description = apk_cfg.description orelse project_name,
+        .license = apk_cfg.license orelse "unknown",
+        .maintainer = apk_cfg.getMaintainer(),
+        .url = apk_cfg.url orelse "",
+        .binary_path = binary_path,
+        .output_path = apk_output,
+    };
+
+    packagers.apk.generate(allocator, io, apk_gen_cfg) catch |err| {
+        log.err("failed to generate .apk for {s}-{s}: {}", .{ target.os, target.arch, err });
+        allocator.free(apk_output);
+        return null;
+    };
+
+    log.info("generated {s}", .{apk_output});
+    return apk_output;
+}
+
 /// Context for parallel packaging workers.
 const PackageWorkerContext = struct {
     allocator: std.mem.Allocator,
@@ -400,6 +476,7 @@ pub fn generatePackages(
                 .archive_path = null,
                 .deb_path = null,
                 .rpm_path = null,
+                .apk_path = null,
                 .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
             };
         }
@@ -465,6 +542,7 @@ pub fn generatePackages(
             if (result.archive_path) |p| try all_paths.append(allocator, p);
             if (result.deb_path) |p| try all_paths.append(allocator, p);
             if (result.rpm_path) |p| try all_paths.append(allocator, p);
+            if (result.apk_path) |p| try all_paths.append(allocator, p);
         }
 
         const checksum_summary = checksum.generateChecksums(
@@ -536,6 +614,7 @@ fn packageWorker(
         if (context.cfg.packages) |p| p.tarball else null,
         if (context.cfg.packages) |p| p.deb else null,
         if (context.cfg.packages) |p| p.rpm else null,
+        if (context.cfg.packages) |p| p.apk else null,
     ) catch |err| {
         const target_triple_temp = formatTargetTriple(temp_allocator, target) catch {
             return;
@@ -557,6 +636,7 @@ fn packageWorker(
             .archive_path = null,
             .deb_path = null,
             .rpm_path = null,
+            .apk_path = null,
             .error_message = if (error_msg_temp) |msg| allocator.dupe(u8, msg) catch null else null,
         };
         return;
@@ -567,6 +647,7 @@ fn packageWorker(
         if (result.archive_path) |path| temp_allocator.free(path);
         if (result.deb_path) |path| temp_allocator.free(path);
         if (result.rpm_path) |path| temp_allocator.free(path);
+        if (result.apk_path) |path| temp_allocator.free(path);
         if (result.error_message) |msg| temp_allocator.free(msg);
     }
 
@@ -574,6 +655,7 @@ fn packageWorker(
     const copied_archive = if (result.archive_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_deb = if (result.deb_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_rpm = if (result.rpm_path) |path| allocator.dupe(u8, path) catch null else null;
+    const copied_apk = if (result.apk_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_error = if (result.error_message) |msg| allocator.dupe(u8, msg) catch null else null;
 
     context.allocator_mutex.lockUncancelable(context.io);
@@ -585,6 +667,7 @@ fn packageWorker(
         .archive_path = copied_archive,
         .deb_path = copied_deb,
         .rpm_path = copied_rpm,
+        .apk_path = copied_apk,
         .error_message = copied_error,
     };
 
@@ -658,6 +741,7 @@ test "PackageSummary calculates correctly" {
         .archive_path = try allocator.dupe(u8, "/path/to/archive.tar.gz"),
         .deb_path = null,
         .rpm_path = null,
+        .apk_path = null,
         .error_message = null,
     };
 
@@ -667,6 +751,7 @@ test "PackageSummary calculates correctly" {
         .archive_path = null,
         .deb_path = null,
         .rpm_path = null,
+        .apk_path = null,
         .error_message = try allocator.dupe(u8, "Build failed"),
     };
 
@@ -676,6 +761,7 @@ test "PackageSummary calculates correctly" {
         .archive_path = try allocator.dupe(u8, "/path/to/archive.zip"),
         .deb_path = null,
         .rpm_path = null,
+        .apk_path = null,
         .error_message = null,
     };
 
@@ -745,6 +831,7 @@ test "packageWorkerLoop claims all indices with bounded workers" {
             .archive_path = null,
             .deb_path = null,
             .rpm_path = null,
+            .apk_path = null,
             .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
         };
     }

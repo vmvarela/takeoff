@@ -37,6 +37,13 @@
             "license": "MIT",
             "packager": "Victor M. Varela <vmvarela@gmail.com>",
             "url": "https://github.com/vmvarela/zr"
+        },
+        // .apk packages are generated for Linux targets only (Alpine Linux)
+        "apk": {
+            "description": "Release automation for Zig projects",
+            "license": "MIT",
+            "maintainer": "Victor M. Varela <vmvarela@gmail.com>",
+            "url": "https://github.com/vmvarela/zr"
         }
     },
 
