@@ -70,8 +70,46 @@ pub const TarballPackage = struct {
     }
 };
 
+/// Configuration for generating `.deb` packages (Debian/Ubuntu).
+pub const DebPackage = struct {
+    /// Maintainer field — "Full Name <email@example.com>".
+    maintainer: ?[]const u8 = null,
+    /// SPDX license identifier written to the `License` control field.
+    license: ?[]const u8 = null,
+
+    pub fn getMaintainer(self: @This()) []const u8 {
+        return self.maintainer orelse "Unknown <unknown@example.com>";
+    }
+};
+
+/// Configuration for generating `.rpm` packages (Fedora/RHEL/openSUSE).
+pub const RpmPackage = struct {
+    /// RPM release string (e.g. "1"). Defaults to "1".
+    release: ?[]const u8 = null,
+    /// One-line package summary shown in `rpm -qi`.
+    summary: ?[]const u8 = null,
+    /// Multi-line description shown in `rpm -qi`.
+    description: ?[]const u8 = null,
+    /// SPDX license identifier.
+    license: ?[]const u8 = null,
+    /// Packager field — "Full Name <email@example.com>".
+    packager: ?[]const u8 = null,
+    /// URL for the project's home page.
+    url: ?[]const u8 = null,
+
+    pub fn getRelease(self: @This()) []const u8 {
+        return self.release orelse "1";
+    }
+
+    pub fn getPackager(self: @This()) []const u8 {
+        return self.packager orelse "Unknown <unknown@example.com>";
+    }
+};
+
 pub const Packages = struct {
     tarball: ?TarballPackage = null,
+    deb: ?DebPackage = null,
+    rpm: ?RpmPackage = null,
 };
 
 pub const GitHubRelease = struct {
@@ -169,7 +207,19 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
                 .completions = try dupeOptStr(allocator, tb.completions),
             };
         } else null;
-        break :blk Packages{ .tarball = tarball };
+        const deb: ?DebPackage = if (pkg.deb) |d| DebPackage{
+            .maintainer = try dupeOptStr(allocator, d.maintainer),
+            .license = try dupeOptStr(allocator, d.license),
+        } else null;
+        const rpm: ?RpmPackage = if (pkg.rpm) |r| RpmPackage{
+            .release = try dupeOptStr(allocator, r.release),
+            .summary = try dupeOptStr(allocator, r.summary),
+            .description = try dupeOptStr(allocator, r.description),
+            .license = try dupeOptStr(allocator, r.license),
+            .packager = try dupeOptStr(allocator, r.packager),
+            .url = try dupeOptStr(allocator, r.url),
+        } else null;
+        break :blk Packages{ .tarball = tarball, .deb = deb, .rpm = rpm };
     } else null;
 
     const release: ?Release = if (src.release) |rel| blk: {
@@ -566,6 +616,99 @@ test "resolveTemplate returns error for unterminated expression" {
     };
 
     try std.testing.expectError(error.UnterminatedExpression, resolveTemplate(allocator, "prefix{{ env.TEST", ctx));
+}
+
+test "load parses packages.deb config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {"name": "mypkg"},
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}],
+        \\  "packages": {
+        \\    "deb": {
+        \\      "maintainer": "Alice <alice@example.com>",
+        \\      "license": "MIT"
+        \\    }
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+
+    try std.testing.expect(cfg.packages != null);
+    try std.testing.expect(cfg.packages.?.deb != null);
+    const deb = cfg.packages.?.deb.?;
+    try std.testing.expectEqualStrings("Alice <alice@example.com>", deb.getMaintainer());
+    try std.testing.expectEqualStrings("MIT", deb.license.?);
+}
+
+test "DebPackage getMaintainer returns default when nil" {
+    const d = DebPackage{};
+    try std.testing.expectEqualStrings("Unknown <unknown@example.com>", d.getMaintainer());
+}
+
+test "RpmPackage getRelease returns default when nil" {
+    const r = RpmPackage{};
+    try std.testing.expectEqualStrings("1", r.getRelease());
+}
+
+test "RpmPackage getPackager returns default when nil" {
+    const r = RpmPackage{};
+    try std.testing.expectEqualStrings("Unknown <unknown@example.com>", r.getPackager());
+}
+
+test "load parses packages.rpm config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {"name": "mypkg"},
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}],
+        \\  "packages": {
+        \\    "rpm": {
+        \\      "release": "2",
+        \\      "summary": "My package",
+        \\      "license": "Apache-2.0",
+        \\      "packager": "Bob <bob@example.com>"
+        \\    }
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+
+    try std.testing.expect(cfg.packages != null);
+    try std.testing.expect(cfg.packages.?.rpm != null);
+    const r = cfg.packages.?.rpm.?;
+    try std.testing.expectEqualStrings("2", r.getRelease());
+    try std.testing.expectEqualStrings("My package", r.summary.?);
+    try std.testing.expectEqualStrings("Apache-2.0", r.license.?);
+    try std.testing.expectEqualStrings("Bob <bob@example.com>", r.getPackager());
 }
 
 test "resolveTemplate returns error for empty expression" {

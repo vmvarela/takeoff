@@ -13,6 +13,7 @@ pub const git = @import("git.zig");
 pub const progress = @import("progress.zig");
 pub const archive = @import("archive.zig");
 pub const packager = @import("packager.zig");
+pub const packagers = @import("packagers/mod.zig");
 pub const checksum = @import("checksum.zig");
 pub const verify = @import("verify.zig");
 pub const changelog = @import("changelog.zig");
