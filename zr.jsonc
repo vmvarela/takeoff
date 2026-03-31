@@ -24,6 +24,11 @@
         "tarball": {
             "format": "tar.gz",
             "extra_files": ["LICENSE", "README.md"]
+        },
+        // .deb packages are generated for Linux targets only
+        "deb": {
+            "maintainer": "Victor M. Varela <vmvarela@gmail.com>",
+            "license": "MIT"
         }
     },
 

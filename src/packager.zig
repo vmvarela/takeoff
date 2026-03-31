@@ -2,6 +2,7 @@ const std = @import("std");
 const archive = @import("archive.zig");
 const config = @import("config.zig");
 const checksum = @import("checksum.zig");
+const packagers = @import("packagers/mod.zig");
 
 const log = std.log.scoped(.packager);
 
@@ -17,11 +18,14 @@ pub const PackageResult = struct {
     target: []const u8,
     success: bool,
     archive_path: ?[]const u8,
+    /// Path to the generated `.deb` package, if one was produced.
+    deb_path: ?[]const u8,
     error_message: ?[]const u8,
 
     pub fn deinit(self: *PackageResult, allocator: std.mem.Allocator) void {
         allocator.free(self.target);
         if (self.archive_path) |p| allocator.free(p);
+        if (self.deb_path) |p| allocator.free(p);
         if (self.error_message) |m| allocator.free(m);
     }
 };
@@ -47,6 +51,9 @@ pub const PackageSummary = struct {
 
             if (result.success) {
                 if (result.archive_path) |path| {
+                    try writer.print("   → {s}\n", .{path});
+                }
+                if (result.deb_path) |path| {
                     try writer.print("   → {s}\n", .{path});
                 }
             } else {
@@ -101,6 +108,7 @@ fn packageTarget(
     version: []const u8,
     output_dir: []const u8,
     pkg_config: ?config.TarballPackage,
+    deb_config: ?config.DebPackage,
 ) PackageError!PackageResult {
     const target_triple = try formatTargetTriple(allocator, target);
     errdefer allocator.free(target_triple);
@@ -131,6 +139,7 @@ fn packageTarget(
             .target = target_triple,
             .success = false,
             .archive_path = null,
+            .deb_path = null,
             .error_message = error_msg,
         };
     };
@@ -165,31 +174,92 @@ fn packageTarget(
     // Create the archive
     const archive_result = try archive.createArchive(allocator, io, archive_config);
 
-    if (archive_result.success) {
-        const path_copy = if (archive_result.output_path) |p|
-            try allocator.dupe(u8, p)
-        else
-            null;
-
-        return PackageResult{
-            .target = target_triple,
-            .success = true,
-            .archive_path = path_copy,
-            .error_message = null,
-        };
-    } else {
+    if (!archive_result.success) {
         const error_copy = if (archive_result.error_message) |m|
             try allocator.dupe(u8, m)
         else
             null;
-
         return PackageResult{
             .target = target_triple,
             .success = false,
             .archive_path = null,
+            .deb_path = null,
             .error_message = error_copy,
         };
     }
+
+    const path_copy = if (archive_result.output_path) |p|
+        try allocator.dupe(u8, p)
+    else
+        null;
+
+    // Generate a .deb package for Linux targets when deb config is present.
+    var deb_path_copy: ?[]const u8 = null;
+    if (deb_config != null and std.mem.eql(u8, target.os, "linux")) {
+        deb_path_copy = try packageTargetDeb(
+            allocator,
+            io,
+            target,
+            binary_path,
+            project_name,
+            version,
+            output_dir,
+            deb_config.?,
+        );
+    }
+
+    return PackageResult{
+        .target = target_triple,
+        .success = true,
+        .archive_path = path_copy,
+        .deb_path = deb_path_copy,
+        .error_message = null,
+    };
+}
+
+/// Generate a `.deb` package for a single Linux target.
+///
+/// Returns the output path on success, or null if generation failed (error is
+/// logged but does not abort the tarball packaging result).
+fn packageTargetDeb(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    target: config.Target,
+    binary_path: []const u8,
+    project_name: []const u8,
+    version: []const u8,
+    output_dir: []const u8,
+    deb_cfg: config.DebPackage,
+) !?[]const u8 {
+    const deb_arch = packagers.deb.debArch(target.arch);
+    const deb_name = try std.fmt.allocPrint(
+        allocator,
+        "{s}_{s}_{s}.deb",
+        .{ project_name, version, deb_arch },
+    );
+    defer allocator.free(deb_name);
+
+    const deb_output = try std.fs.path.join(allocator, &.{ output_dir, deb_name });
+    errdefer allocator.free(deb_output);
+
+    const deb_gen_cfg = packagers.deb.DebConfig{
+        .name = project_name,
+        .version = version,
+        .arch = deb_arch,
+        .maintainer = deb_cfg.getMaintainer(),
+        .license = deb_cfg.license orelse "unknown",
+        .binary_path = binary_path,
+        .output_path = deb_output,
+    };
+
+    packagers.deb.generate(allocator, io, deb_gen_cfg) catch |err| {
+        log.err("failed to generate .deb for {s}-{s}: {}", .{ target.os, target.arch, err });
+        allocator.free(deb_output);
+        return null;
+    };
+
+    log.info("generated {s}", .{deb_output});
+    return deb_output;
 }
 
 /// Context for parallel packaging workers.
@@ -254,6 +324,7 @@ pub fn generatePackages(
                 .target = target_triple,
                 .success = false,
                 .archive_path = null,
+                .deb_path = null,
                 .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
             };
         }
@@ -310,20 +381,19 @@ pub fn generatePackages(
 
     // Generate checksums if we have successful packages
     if (summary.succeeded > 0) {
-        var archive_paths = try allocator.alloc([]const u8, summary.succeeded);
-        defer allocator.free(archive_paths);
+        // Collect all artifact paths (tarball + deb) for checksum generation.
+        var all_paths: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer all_paths.deinit(allocator);
 
-        var idx: usize = 0;
         for (results) |result| {
-            if (result.success and result.archive_path != null) {
-                archive_paths[idx] = result.archive_path.?;
-                idx += 1;
-            }
+            if (!result.success) continue;
+            if (result.archive_path) |p| try all_paths.append(allocator, p);
+            if (result.deb_path) |p| try all_paths.append(allocator, p);
         }
 
         const checksum_summary = checksum.generateChecksums(
             allocator,
-            archive_paths,
+            all_paths.items,
             output_dir,
         ) catch |err| blk: {
             log.err("failed to generate checksums: {}", .{err});
@@ -388,6 +458,7 @@ fn packageWorker(
         context.version,
         context.output_dir,
         if (context.cfg.packages) |p| p.tarball else null,
+        if (context.cfg.packages) |p| p.deb else null,
     ) catch |err| {
         const target_triple_temp = formatTargetTriple(temp_allocator, target) catch {
             return;
@@ -407,6 +478,7 @@ fn packageWorker(
             .target = allocator.dupe(u8, target_triple_temp) catch return,
             .success = false,
             .archive_path = null,
+            .deb_path = null,
             .error_message = if (error_msg_temp) |msg| allocator.dupe(u8, msg) catch null else null,
         };
         return;
@@ -415,11 +487,13 @@ fn packageWorker(
     defer {
         temp_allocator.free(result.target);
         if (result.archive_path) |path| temp_allocator.free(path);
+        if (result.deb_path) |path| temp_allocator.free(path);
         if (result.error_message) |msg| temp_allocator.free(msg);
     }
 
     const copied_target = allocator.dupe(u8, result.target) catch return;
     const copied_archive = if (result.archive_path) |path| allocator.dupe(u8, path) catch null else null;
+    const copied_deb = if (result.deb_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_error = if (result.error_message) |msg| allocator.dupe(u8, msg) catch null else null;
 
     context.allocator_mutex.lockUncancelable(context.io);
@@ -429,6 +503,7 @@ fn packageWorker(
         .target = copied_target,
         .success = result.success,
         .archive_path = copied_archive,
+        .deb_path = copied_deb,
         .error_message = copied_error,
     };
 
@@ -500,6 +575,7 @@ test "PackageSummary calculates correctly" {
         .target = try allocator.dupe(u8, "linux-x86_64"),
         .success = true,
         .archive_path = try allocator.dupe(u8, "/path/to/archive.tar.gz"),
+        .deb_path = null,
         .error_message = null,
     };
 
@@ -507,6 +583,7 @@ test "PackageSummary calculates correctly" {
         .target = try allocator.dupe(u8, "macos-aarch64"),
         .success = false,
         .archive_path = null,
+        .deb_path = null,
         .error_message = try allocator.dupe(u8, "Build failed"),
     };
 
@@ -514,6 +591,7 @@ test "PackageSummary calculates correctly" {
         .target = try allocator.dupe(u8, "windows-x86_64"),
         .success = true,
         .archive_path = try allocator.dupe(u8, "/path/to/archive.zip"),
+        .deb_path = null,
         .error_message = null,
     };
 
@@ -581,6 +659,7 @@ test "packageWorkerLoop claims all indices with bounded workers" {
             .target = try std.fmt.allocPrint(allocator, "{s}-{s}", .{ target.os, target.arch }),
             .success = false,
             .archive_path = null,
+            .deb_path = null,
             .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
         };
     }
