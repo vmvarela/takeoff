@@ -70,8 +70,21 @@ pub const TarballPackage = struct {
     }
 };
 
+/// Configuration for generating `.deb` packages (Debian/Ubuntu).
+pub const DebPackage = struct {
+    /// Maintainer field — "Full Name <email@example.com>".
+    maintainer: ?[]const u8 = null,
+    /// SPDX license identifier written to the `License` control field.
+    license: ?[]const u8 = null,
+
+    pub fn getMaintainer(self: @This()) []const u8 {
+        return self.maintainer orelse "Unknown <unknown@example.com>";
+    }
+};
+
 pub const Packages = struct {
     tarball: ?TarballPackage = null,
+    deb: ?DebPackage = null,
 };
 
 pub const GitHubRelease = struct {
@@ -169,7 +182,11 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
                 .completions = try dupeOptStr(allocator, tb.completions),
             };
         } else null;
-        break :blk Packages{ .tarball = tarball };
+        const deb: ?DebPackage = if (pkg.deb) |d| DebPackage{
+            .maintainer = try dupeOptStr(allocator, d.maintainer),
+            .license = try dupeOptStr(allocator, d.license),
+        } else null;
+        break :blk Packages{ .tarball = tarball, .deb = deb };
     } else null;
 
     const release: ?Release = if (src.release) |rel| blk: {
@@ -566,6 +583,48 @@ test "resolveTemplate returns error for unterminated expression" {
     };
 
     try std.testing.expectError(error.UnterminatedExpression, resolveTemplate(allocator, "prefix{{ env.TEST", ctx));
+}
+
+test "load parses packages.deb config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {"name": "mypkg"},
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}],
+        \\  "packages": {
+        \\    "deb": {
+        \\      "maintainer": "Alice <alice@example.com>",
+        \\      "license": "MIT"
+        \\    }
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+
+    try std.testing.expect(cfg.packages != null);
+    try std.testing.expect(cfg.packages.?.deb != null);
+    const deb = cfg.packages.?.deb.?;
+    try std.testing.expectEqualStrings("Alice <alice@example.com>", deb.getMaintainer());
+    try std.testing.expectEqualStrings("MIT", deb.license.?);
+}
+
+test "DebPackage getMaintainer returns default when nil" {
+    const d = DebPackage{};
+    try std.testing.expectEqualStrings("Unknown <unknown@example.com>", d.getMaintainer());
 }
 
 test "resolveTemplate returns error for empty expression" {
