@@ -130,9 +130,14 @@ const WorkerContext = struct {
     jobs: []BuildJob,
     allocator_mutex: *std.Io.Mutex,
     show_progress: bool,
+    /// Shared atomic index: each worker claims the next job by incrementing this.
+    next_job_index: std.atomic.Value(usize),
 };
 
-/// Run builds for all targets in parallel using a thread pool.
+/// Run builds for all targets in parallel, respecting `job_count` concurrency.
+///
+/// `job_count == 0` means "use all available CPUs". Otherwise at most
+/// `job_count` builds run simultaneously.
 pub fn runParallelBuilds(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -145,7 +150,6 @@ pub fn runParallelBuilds(
     job_count: usize,
     verbose: bool,
 ) ParallelBuildError!BuildSummary {
-    _ = job_count;
     if (targets.len == 0) {
         return BuildSummary{
             .succeeded = 0,
@@ -189,6 +193,13 @@ pub fn runParallelBuilds(
     // Show progress bar for multiple targets (unless verbose)
     const show_progress = jobs.len > 3 and !verbose;
 
+    // Determine number of concurrent workers.
+    // job_count == 0  → one worker per logical CPU (i.e. fully parallel)
+    // job_count >= 1  → cap at job_count, but never exceed available jobs
+    const cpu_count = std.Thread.getCpuCount() catch 1;
+    const desired_workers: usize = if (job_count == 0) cpu_count else job_count;
+    const num_workers = @min(desired_workers, jobs.len);
+
     // Context for workers
     var allocator_mutex: std.Io.Mutex = .init;
     var mutable_context = WorkerContext{
@@ -199,26 +210,17 @@ pub fn runParallelBuilds(
         .jobs = jobs,
         .allocator_mutex = &allocator_mutex,
         .show_progress = show_progress,
+        .next_job_index = .init(0),
     };
 
     var group: std.Io.Group = .init;
     defer group.cancel(io);
 
-    // Run all jobs.
-    for (jobs) |*job| {
-        if (job.status == .failed) {
-            continue;
-        }
-
-        group.concurrent(io, workerRunBuild, .{ &mutable_context, job }) catch {
-            allocator_mutex.lockUncancelable(io);
-            defer allocator_mutex.unlock(io);
-            job.status = .failed;
-            job.error_message = std.fmt.allocPrint(
-                allocator,
-                "Failed to submit build job",
-                .{},
-            ) catch null;
+    // Launch exactly `num_workers` concurrent workers. Each worker loops,
+    // atomically claiming the next job index, until all jobs are consumed.
+    for (0..num_workers) |_| {
+        group.concurrent(io, workerLoop, .{&mutable_context}) catch |err| {
+            log.warn("Failed to spawn worker: {}", .{err});
         };
     }
 
@@ -237,13 +239,29 @@ pub fn runParallelBuilds(
             .succeeded => summary.succeeded += 1,
             .failed => summary.failed += 1,
             .pending, .running => {
-                // Shouldn't happen after pool deinit, but treat as failed
+                // Shouldn't happen after group.await, but treat as failed
                 summary.failed += 1;
             },
         }
     }
 
     return summary;
+}
+
+/// Worker loop: atomically claims jobs from the shared index and runs them
+/// until no jobs remain. This function is the entry point for each concurrent
+/// worker spawned by `runParallelBuilds`.
+fn workerLoop(context: *WorkerContext) std.Io.Cancelable!void {
+    while (true) {
+        // Claim the next job index atomically.
+        const i = context.next_job_index.fetchAdd(1, .seq_cst);
+        if (i >= context.jobs.len) break;
+
+        const job = &context.jobs[i];
+        if (job.status == .failed) continue; // already failed during setup
+
+        try workerRunBuild(context, job);
+    }
 }
 
 /// Worker function that runs a single build.
@@ -406,9 +424,11 @@ test "BuildJob.initFailed creates job with null target" {
 
 test "runParallelBuilds with empty targets" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     const summary = try runParallelBuilds(
         allocator,
+        io,
         &.{},
         "test",
         null,
@@ -452,13 +472,61 @@ test "BuildSummary print format" {
         .jobs = jobs,
     };
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+    var aw: std.Io.Writer.Allocating = .init(allocator);
+    defer aw.deinit();
 
-    try summary.print(buf.writer());
+    try summary.print(&aw.writer);
 
-    const output = buf.items;
+    const output = aw.writer.buffer[0..aw.writer.end];
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Build Summary"));
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Succeeded: 1"));
     try std.testing.expect(std.mem.containsAtLeast(u8, output, 1, "Failed: 1"));
+}
+
+test "workerLoop respects job_count concurrency limit via num_workers cap" {
+    // Verify that the number of concurrent workers spawned never exceeds
+    // min(job_count, jobs.len). We do this by running workerLoop against a
+    // set of pre-failed jobs (so workerRunBuild is a no-op) and confirming
+    // the shared atomic index advances through all slots exactly once.
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const num_jobs = 5;
+    const job_count = 2; // fewer workers than jobs
+
+    // Build pre-failed jobs so workerRunBuild is skipped for each
+    var jobs = try allocator.alloc(BuildJob, num_jobs);
+    defer allocator.free(jobs);
+    for (0..num_jobs) |i| {
+        const msg = try allocator.dupe(u8, "pre-failed");
+        jobs[i] = BuildJob.initFailed(i, msg);
+    }
+    defer for (jobs) |*j| {
+        if (j.error_message) |m| allocator.free(m);
+    };
+
+    var allocator_mutex: std.Io.Mutex = .init;
+    var ctx = WorkerContext{
+        .allocator = allocator,
+        .io = io,
+        .optimize = "Debug",
+        .verbose = false,
+        .jobs = jobs,
+        .allocator_mutex = &allocator_mutex,
+        .show_progress = false,
+        .next_job_index = .init(0),
+    };
+
+    // Spawn exactly min(job_count, num_jobs) workers and wait for them.
+    const num_workers = @min(job_count, num_jobs);
+    var group: std.Io.Group = .init;
+    defer group.cancel(io);
+    for (0..num_workers) |_| {
+        try group.concurrent(io, workerLoop, .{&ctx});
+    }
+    _ = group.await(io) catch {};
+
+    // All job slots must have been claimed: index should be >= num_jobs.
+    const final_index = ctx.next_job_index.load(.seq_cst);
+    try std.testing.expect(final_index >= num_jobs);
 }

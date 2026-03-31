@@ -5,10 +5,10 @@ pub const ProgressBar = struct {
     total: usize,
     current: usize,
     width: usize,
-    writer: std.io.AnyWriter,
+    writer: *std.Io.Writer,
 
     /// Initialize a new progress bar
-    pub fn init(total: usize, width: usize, writer: std.io.AnyWriter) ProgressBar {
+    pub fn init(total: usize, width: usize, writer: *std.Io.Writer) ProgressBar {
         return .{
             .total = total,
             .current = 0,
@@ -64,10 +64,9 @@ pub const ProgressBar = struct {
 
 test "ProgressBar initializes correctly" {
     var buf: [256]u8 = undefined;
-    var fbs = std.io.fixedBufferStream(&buf);
-    const writer = fbs.writer().any();
+    var w: std.Io.Writer = .fixed(&buf);
 
-    const pb = ProgressBar.init(10, 20, writer);
+    const pb = ProgressBar.init(10, 20, &w);
     try std.testing.expectEqual(@as(usize, 10), pb.total);
     try std.testing.expectEqual(@as(usize, 0), pb.current);
     try std.testing.expectEqual(@as(usize, 20), pb.width);

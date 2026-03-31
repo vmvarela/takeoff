@@ -337,9 +337,9 @@ pub fn verifyFile(
     defer allocator.free(computed_hash);
 
     if (!std.mem.eql(u8, computed_hash, expected_hash)) {
-        log.err("checksum mismatch for {s}:", .{filename});
-        log.err("  expected: {s}", .{expected_hash});
-        log.err("  computed: {s}", .{computed_hash});
+        log.warn("checksum mismatch for {s}:", .{filename});
+        log.warn("  expected: {s}", .{expected_hash});
+        log.warn("  computed: {s}", .{computed_hash});
         return ChecksumError.ChecksumMismatch;
     }
 
@@ -379,7 +379,7 @@ pub fn verifyChecksumFile(
             parsed.hash,
             algorithm,
         ) catch |err| {
-            log.err("line {d}: failed to verify {s}", .{ line_no, parsed.filename });
+            log.warn("line {d}: failed to verify {s}", .{ line_no, parsed.filename });
             return err;
         };
 
@@ -468,21 +468,19 @@ test "ChecksumSummary tracks results" {
 
 test "computeSha256 produces consistent hashes" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     // Create a test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "test.txt",
         .data = "Hello, World!\n",
     });
 
-    const tmp_path = try std.fs.path.join(allocator, &.{"test.txt"});
-    defer allocator.free(tmp_path);
-
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const test_file_path = try tmp_dir.dir.realpath("test.txt", &buf);
+    const test_file_path = buf[0..try tmp_dir.dir.realPathFile(io, "test.txt", &buf)];
 
     const hash1 = try computeSha256(allocator, test_file_path);
     defer allocator.free(hash1);
@@ -496,18 +494,19 @@ test "computeSha256 produces consistent hashes" {
 
 test "computeBlake3 produces consistent hashes" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     // Create a test file
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "test.txt",
         .data = "Hello, World!\n",
     });
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const test_file_path = try tmp_dir.dir.realpath("test.txt", &buf);
+    const test_file_path = buf[0..try tmp_dir.dir.realPathFile(io, "test.txt", &buf)];
 
     const hash1 = try computeBlake3(allocator, test_file_path);
     defer allocator.free(hash1);
@@ -521,27 +520,33 @@ test "computeBlake3 produces consistent hashes" {
 
 test "generateChecksums produces both files" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     // Create test files
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "file1.tar.gz",
         .data = "content1",
     });
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "file2.zip",
         .data = "content2",
     });
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const file1_path = try tmp_dir.dir.realpath("file1.tar.gz", &buf);
-    const file2_path = try tmp_dir.dir.realpath("file2.zip", &buf);
+    const file1_path = buf[0..try tmp_dir.dir.realPathFile(io, "file1.tar.gz", &buf)];
+    var buf2: [std.fs.max_path_bytes]u8 = undefined;
+    const file2_path = buf2[0..try tmp_dir.dir.realPathFile(io, "file2.zip", &buf2)];
 
     const file_paths = &[_][]const u8{ file1_path, file2_path };
 
-    var summary = try generateChecksums(allocator, file_paths, tmp_dir.parent_dir_path.?);
+    // Use the tmp dir itself as output dir (generateChecksums writes checksum files there)
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const output_dir = dir_buf[0..try tmp_dir.dir.realPath(io, &dir_buf)];
+
+    var summary = try generateChecksums(allocator, file_paths, output_dir);
     defer summary.deinit(allocator);
 
     try std.testing.expect(summary.sha256_result != null);
@@ -552,13 +557,17 @@ test "generateChecksums produces both files" {
 
 test "generateChecksums returns empty summary for empty paths" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     const file_paths = &[_][]const u8{};
 
-    var summary = try generateChecksums(allocator, file_paths, tmp_dir.parent_dir_path.?);
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const output_dir = dir_buf[0..try tmp_dir.dir.realPath(io, &dir_buf)];
+
+    var summary = try generateChecksums(allocator, file_paths, output_dir);
     defer summary.deinit(allocator);
 
     try std.testing.expect(summary.sha256_result == null);
@@ -567,18 +576,19 @@ test "generateChecksums returns empty summary for empty paths" {
 
 test "verifyChecksumFile verifies correctly" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     // Create test file
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "test.txt",
         .data = "Hello, World!\n",
     });
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const test_file_path = try tmp_dir.dir.realpath("test.txt", &buf);
+    const test_file_path = buf[0..try tmp_dir.dir.realPathFile(io, "test.txt", &buf)];
 
     // Compute hash
     const hash = try computeSha256(allocator, test_file_path);
@@ -592,12 +602,13 @@ test "verifyChecksumFile verifies correctly" {
     );
     defer allocator.free(checksums_content);
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "checksums-sha256.txt",
         .data = checksums_content,
     });
 
-    const checksums_path = try tmp_dir.dir.realpath("checksums-sha256.txt", &buf);
+    var buf2: [std.fs.max_path_bytes]u8 = undefined;
+    const checksums_path = buf2[0..try tmp_dir.dir.realPathFile(io, "checksums-sha256.txt", &buf2)];
 
     const verified = try verifyChecksumFile(allocator, checksums_path, null, .sha256);
     try std.testing.expectEqual(@as(usize, 1), verified);

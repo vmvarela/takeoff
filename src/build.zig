@@ -463,7 +463,7 @@ test "BuildResult stores build status" {
         null,
     );
 
-    const result = BuildResult{
+    var result = BuildResult{
         .target = build_target,
         .success = true,
         .artifact_path = try allocator.dupe(u8, "/path/to/binary"),

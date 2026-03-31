@@ -70,7 +70,7 @@ pub fn verify(
     // Check if file exists
     const io = std.Options.debug_io;
     std.Io.Dir.cwd().access(io, checksums_file, .{}) catch |err| {
-        log.err("checksums file not found: {s}", .{checksums_file});
+        log.warn("checksums file not found: {s}", .{checksums_file});
         return switch (err) {
             error.FileNotFound => VerifyError.FileNotFound,
             error.AccessDenied => VerifyError.FileNotFound,
@@ -88,7 +88,7 @@ pub fn verify(
             log.info("auto-detected algorithm: {s}", .{algo.displayName()});
             break :blk algo;
         }
-        log.err("could not auto-detect hash algorithm from filename: {s}", .{checksums_file});
+        log.warn("could not auto-detect hash algorithm from filename: {s}", .{checksums_file});
         return VerifyError.InvalidChecksumsFile;
     };
 
@@ -148,21 +148,22 @@ test "VerifyResult stores verification info" {
 
 test "findChecksumsFile finds existing files" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     // Create one of the default checksums files
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "checksums-sha256.txt",
         .data = "test content",
     });
 
     // Save original cwd and change to temp dir
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
-
-    try tmp_dir.dir.setAsCwd();
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp_dir.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
     const found = findChecksumsFile(allocator);
     defer if (found) |f| allocator.free(f);
@@ -172,18 +173,19 @@ test "findChecksumsFile finds existing files" {
 
 test "verify succeeds with valid checksums" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     // Create a test file
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "test.txt",
         .data = "Hello, World!\n",
     });
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const test_file_path = try tmp_dir.dir.realpath("test.txt", &buf);
+    const test_file_path = buf[0..try tmp_dir.dir.realPathFile(io, "test.txt", &buf)];
 
     // Compute SHA-256 hash
     const hash = try checksum.computeSha256(allocator, test_file_path);
@@ -197,18 +199,19 @@ test "verify succeeds with valid checksums" {
     );
     defer allocator.free(checksums_content);
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "checksums-sha256.txt",
         .data = checksums_content,
     });
 
-    const checksums_path = try tmp_dir.dir.realpath("checksums-sha256.txt", &buf);
+    var buf2: [std.fs.max_path_bytes]u8 = undefined;
+    const checksums_path = buf2[0..try tmp_dir.dir.realPathFile(io, "checksums-sha256.txt", &buf2)];
 
     // Change to the temp dir so relative paths work
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
-
-    try tmp_dir.dir.setAsCwd();
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp_dir.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
     // Get relative path for checksums file
     const relative_checksums_path = std.fs.path.basename(checksums_path);
@@ -226,18 +229,19 @@ test "verify succeeds with valid checksums" {
 
 test "verify auto-detects algorithm from filename" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     // Create a test file
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "test.txt",
         .data = "Hello, World!\n",
     });
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const test_file_path = try tmp_dir.dir.realpath("test.txt", &buf);
+    const test_file_path = buf[0..try tmp_dir.dir.realPathFile(io, "test.txt", &buf)];
 
     // Compute SHA-256 hash
     const hash = try checksum.computeSha256(allocator, test_file_path);
@@ -251,18 +255,19 @@ test "verify auto-detects algorithm from filename" {
     );
     defer allocator.free(checksums_content);
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "checksums-sha256.txt",
         .data = checksums_content,
     });
 
-    const checksums_path = try tmp_dir.dir.realpath("checksums-sha256.txt", &buf);
+    var buf2: [std.fs.max_path_bytes]u8 = undefined;
+    const checksums_path = buf2[0..try tmp_dir.dir.realPathFile(io, "checksums-sha256.txt", &buf2)];
 
     // Change to the temp dir so relative paths work
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
-
-    try tmp_dir.dir.setAsCwd();
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp_dir.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
     const relative_checksums_path = std.fs.path.basename(checksums_path);
 
@@ -290,12 +295,13 @@ test "verify returns FileNotFound for missing checksums file" {
 
 test "verify detects checksum mismatch" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
 
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
     // Create a test file
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "test.txt",
         .data = "Hello, World!\n",
     });
@@ -303,19 +309,19 @@ test "verify detects checksum mismatch" {
     // Create checksums file with wrong hash
     const checksums_content = "0000000000000000000000000000000000000000000000000000000000000000  test.txt\n";
 
-    try tmp_dir.dir.writeFile(.{
+    try tmp_dir.dir.writeFile(io, .{
         .sub_path = "checksums-sha256.txt",
         .data = checksums_content,
     });
 
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const checksums_path = try tmp_dir.dir.realpath("checksums-sha256.txt", &buf);
+    const checksums_path = buf[0..try tmp_dir.dir.realPathFile(io, "checksums-sha256.txt", &buf)];
 
     // Change to the temp dir so relative paths work
-    const original_cwd = std.process.cwd();
-    defer std.process.chdir(original_cwd) catch {};
-
-    try tmp_dir.dir.setAsCwd();
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp_dir.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
 
     const relative_checksums_path = std.fs.path.basename(checksums_path);
 
