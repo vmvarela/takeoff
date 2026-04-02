@@ -157,6 +157,7 @@ pub fn renderFormula(
         \\  homepage "{s}"
         \\  url "{s}"
         \\  sha256 "{s}"
+        \\  version "{s}"
         \\  license "{s}"
         \\{s}
         \\
@@ -177,6 +178,7 @@ pub fn renderFormula(
         cfg.homepage,
         cfg.tarball_url,
         cfg.tarball_sha256,
+        cfg.version,
         cfg.license,
         head_block,
         cfg.project_name,
@@ -350,6 +352,7 @@ test "renderFormula generates valid Ruby formula" {
     try std.testing.expect(std.mem.indexOf(u8, content, "desc \"Release automation for Zig projects\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "homepage \"https://github.com/vmvarela/takeoff\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "sha256 \"abc123def456\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "version \"0.2.0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "license \"MIT\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "bin.install \"bin/takeoff\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "system bin/\"takeoff\", \"--version\"") != null);

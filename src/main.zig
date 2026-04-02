@@ -65,6 +65,9 @@ pub const ReleaseOptions = struct {
     dry_run: bool = false,
     /// Delete existing assets before uploading
     clean_assets: bool = false,
+    /// For each artifact, delete only the same-named existing asset before uploading.
+    /// Mutually exclusive with clean_assets.
+    replace_assets: bool = false,
     /// Also publish/update AUR package metadata after GitHub release.
     aur: bool = false,
     /// Also generate/push Homebrew formula to tap repo after GitHub release.
@@ -279,6 +282,8 @@ pub const Command = union(enum) {
                     options.dry_run = true;
                 } else if (std.mem.eql(u8, opt, "--clean-assets")) {
                     options.clean_assets = true;
+                } else if (std.mem.eql(u8, opt, "--replace-assets")) {
+                    options.replace_assets = true;
                 } else if (std.mem.eql(u8, opt, "--aur")) {
                     options.aur = true;
                 } else if (std.mem.eql(u8, opt, "--homebrew")) {
@@ -301,6 +306,10 @@ pub const Command = union(enum) {
                     log.err("unknown release option: {s}", .{opt});
                     return TakeOff.CliError.InvalidArguments;
                 }
+            }
+            if (options.clean_assets and options.replace_assets) {
+                log.warn("--clean-assets and --replace-assets are mutually exclusive", .{});
+                return TakeOff.CliError.InvalidArguments;
             }
             return Command{ .release = options };
         }
@@ -1111,6 +1120,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
         stdout.print("  Draft: {}\n", .{opts.draft}) catch {};
         stdout.print("  Prerelease: {}\n", .{opts.prerelease}) catch {};
         stdout.print("  Clean assets: {}\n", .{opts.clean_assets}) catch {};
+        stdout.print("  Replace assets: {}\n", .{opts.replace_assets}) catch {};
         stdout.print("  Publish AUR: {}\n", .{opts.aur}) catch {};
         stdout.print("\nRelease notes:\n{s}\n\n", .{notes}) catch {};
         stdout.print("Artifacts to upload:\n", .{}) catch {};
@@ -1213,6 +1223,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
         opts.dist_dir,
         asset_names,
         opts.clean_assets,
+        opts.replace_assets,
     ) catch |err| {
         stderr.print("Error: Release failed: {s}\n", .{@errorName(err)}) catch {};
         return 1;
@@ -1362,7 +1373,9 @@ const usage =
     \\  -d, --draft      Create as draft release
     \\  -p, --prerelease Mark as prerelease
     \\      --dry-run    Show what would be done without publishing
-    \\      --clean-assets Delete existing assets before uploading
+    \\      --clean-assets Delete all existing assets before uploading
+    \\      --replace-assets For each artifact, replace only the same-named
+    \\                   existing asset (mutually exclusive with --clean-assets)
     \\      --aur        Generate PKGBUILD/.SRCINFO and optionally push to AUR
     \\      --homebrew   Generate Homebrew formula and push to tap repo
     \\  -D, --dist DIR   Path to dist directory (default: "dist")
@@ -1639,6 +1652,44 @@ test "Command.fromArgs parses release with --homebrew" {
         },
         else => return error.UnexpectedCommand,
     }
+}
+
+test "Command.fromArgs parses release with --replace-assets" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--replace-assets" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.replace_assets);
+            try std.testing.expect(!opts.clean_assets);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses release with --clean-assets" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--clean-assets" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.clean_assets);
+            try std.testing.expect(!opts.replace_assets);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs rejects --clean-assets and --replace-assets together" {
+    const prev_log_level = std.testing.log_level;
+    defer std.testing.log_level = prev_log_level;
+    std.testing.log_level = .err;
+
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        TakeOff.CliError.InvalidArguments,
+        Command.fromArgs(allocator, &[_][]const u8{ "release", "--clean-assets", "--replace-assets" }),
+    );
 }
 
 test "Command.fromArgs parses verify with multiple options" {

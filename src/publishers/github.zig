@@ -960,6 +960,11 @@ fn guessContentType(filename: []const u8) []const u8 {
 
 /// Publish a release with all artifacts.
 /// This is idempotent - if release exists, it will be updated.
+///
+/// - `clean_assets`: delete **all** existing release assets before uploading.
+/// - `replace_assets`: for each artifact being uploaded, delete only the
+///   same-named existing asset first, then upload the new file.  Mutually
+///   exclusive with `clean_assets` (caller must validate before calling).
 pub fn publishRelease(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -967,6 +972,7 @@ pub fn publishRelease(
     artifact_dir: []const u8,
     assets_to_upload: []const []const u8,
     clean_assets: bool,
+    replace_assets: bool,
 ) GitHubError!ReleaseResult {
     const environ = std.Options.debug_threaded_io.?.environ.process_environ;
     const token = std.process.Environ.getAlloc(environ, allocator, "GITHUB_TOKEN") catch |err| {
@@ -984,7 +990,6 @@ pub fn publishRelease(
     const existing_release = try client.getReleaseByTag(opts.owner, opts.repo, opts.tag);
 
     var release: ReleaseInfo = undefined;
-    var is_update = false;
     var deleted_count: usize = 0;
 
     if (existing_release) |*er| {
@@ -999,7 +1004,6 @@ pub fn publishRelease(
 
         release = try client.updateRelease(er.id, opts);
         @constCast(er).deinit(allocator);
-        is_update = true;
     } else {
         log.info("creating new release for tag {s}", .{opts.tag});
         release = try client.createRelease(opts);
@@ -1007,6 +1011,31 @@ pub fn publishRelease(
     errdefer release.deinit(allocator);
 
     log.info("release URL: {s}", .{release.html_url});
+
+    // Build a name→id map of existing remote assets when replace_assets is
+    // requested.  We do this once after creating/updating the release so we
+    // have the correct release id even for newly created releases.
+    // The map values are asset IDs (u64) stored as a StringHashMap.
+    var existing_asset_map = std.StringHashMapUnmanaged(u64).empty;
+    defer existing_asset_map.deinit(allocator);
+
+    // Track the asset-info slice so we can free the name strings later.
+    var remote_assets: []AssetInfo = &.{};
+    defer {
+        for (remote_assets) |*a| a.deinit(allocator);
+        allocator.free(remote_assets);
+    }
+
+    if (replace_assets) {
+        log.info("fetching existing assets for replace mode...", .{});
+        remote_assets = try client.listReleaseAssets(opts.owner, opts.repo, release.id);
+        for (remote_assets) |asset| {
+            // The name key is owned by the AssetInfo; the map does not need to
+            // duplicate it — the slice outlives the map.
+            try existing_asset_map.put(allocator, asset.name, asset.id);
+        }
+        log.info("found {d} existing asset(s) on release", .{remote_assets.len});
+    }
 
     // Upload assets
     var errors = std.ArrayListUnmanaged([]const u8).empty;
@@ -1035,7 +1064,20 @@ pub fn publishRelease(
             continue;
         };
 
-        log.info("uploading {s}...", .{std.fs.path.basename(full_path)});
+        const asset_name = std.fs.path.basename(full_path);
+
+        // In replace mode, delete the same-named remote asset if it exists.
+        if (replace_assets) {
+            if (existing_asset_map.get(asset_name)) |asset_id| {
+                log.info("replacing existing asset: {s} (id={d})", .{ asset_name, asset_id });
+                client.deleteAsset(opts.owner, opts.repo, asset_id) catch |err| {
+                    log.warn("failed to delete existing asset {s} (id={d}): {} — upload will be attempted anyway", .{ asset_name, asset_id, err });
+                };
+                deleted_count += 1;
+            }
+        }
+
+        log.info("uploading {s}...", .{asset_name});
 
         _ = client.uploadAsset(release.upload_url, full_path) catch |err| {
             const err_msg = try std.fmt.allocPrint(
@@ -1048,7 +1090,7 @@ pub fn publishRelease(
         };
 
         uploaded_count += 1;
-        log.info("uploaded {s}", .{std.fs.path.basename(full_path)});
+        log.info("uploaded {s}", .{asset_name});
     }
 
     const result = ReleaseResult{

@@ -72,3 +72,30 @@ versions. Use the patterns below — do not use the old equivalents.
   `defer if (opt) |v| allocator.free(v);`.
 - **Unused values are compile errors.** If you have a local constant you
   deliberately don't use, discard it with `_ = name;`.
+- **`log.err` in CLI validation causes `zig build test` to fail** even when all
+  tests pass, because the test runner counts every `log.err` call as a failure.
+  Use `log.warn` for user-facing argument errors (invalid flag, missing value,
+  mutually exclusive flags, etc.). Reserve `log.err` for genuine internal
+  failures (network errors, I/O failures, unexpected state).
+
+## Release workflow (dogfooding)
+
+When releasing a new version of takeoff itself:
+
+1. `takeoff bump --minor` — bumps version and updates CHANGELOG.md
+2. `git tag vX.Y.Z && git push origin vX.Y.Z` — create and push the tag
+3. `takeoff build` — rebuild artifacts so filenames include the new tag
+4. `HOMEBREW_TAP_SSH_KEY=~/.ssh/id_rsa_vmvarela takeoff release --tag vX.Y.Z --replace-assets --homebrew`
+   - Always pass `--tag` explicitly. Without it, `takeoff release` calls
+     `git describe --tags`, which returns `vX.Y.Z-N-gSHA` if there are commits
+     after the tag — creating a spurious release with the wrong name.
+   - `--replace-assets` handles re-releases cleanly without a full wipe.
+   - `HOMEBREW_TAP_SSH_KEY` must point to the key for the `vmvarela` GitHub
+     account (`~/.ssh/id_rsa_vmvarela`). The default `github.com` SSH host in
+     this machine maps to a different account (`id_rsa_prisa`).
+
+### Known issue: Homebrew temp dir not cleaned on failure
+
+If the Homebrew tap push fails mid-way, the directory
+`/tmp/takeoff-homebrew-<tap>-<version>` is left behind and the next run fails
+with "already exists". Fix: `rm -rf /tmp/takeoff-homebrew-*` before retrying.

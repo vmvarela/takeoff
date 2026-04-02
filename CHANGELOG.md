@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `takeoff release --replace-assets` flag — for each artifact being uploaded, deletes only the same-named existing asset before uploading; mutually exclusive with `--clean-assets` (#35)
+- Native Scoop manifest generation — produces a valid `<name>.json` manifest with download URL, hash, and architecture metadata (#14)
+- Native Winget manifest generation — produces a valid YAML manifest set (`version`, `installer`, `defaultLocale`) ready for submission to `winget-pkgs` (#15)
+- Native Chocolatey packager — generates `.nuspec` and `.nupkg` from templates, ready for `choco push` (#16)
+- Native `.msi` packager via `wixl` — produces a signed Windows installer from a WiX source template (#17)
+
+### Fixed
+
+- Homebrew formula template now includes an explicit `version` field, preventing `brew` from inferring a wrong version from the tarball filename (e.g., `64` from `aarch64`)
+- Homebrew publisher logs a visible warning when no SSH key is found instead of silently skipping the tap push; accepts `HOMEBREW_TAP_SSH_KEY` environment variable as fallback
+- Homebrew tap temp directory is now removed before cloning and cleaned up on both success and failure, preventing "already exists" errors on re-runs (#38)
+- `takeoff release` now validates that artifact filenames in `dist/` contain the target tag before uploading, aborting early if there is a mismatch (#37)
+
+### Changed
+
+- SSH key for publishers can now be provided via a common `TAKEOFF_SSH_KEY` environment variable as a fallback when no publisher-specific key is configured (#36)
+
 ## [v0.3.0] - 2026-04-02
 
 ### Added
