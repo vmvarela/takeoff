@@ -1,8 +1,8 @@
 const std = @import("std");
-const ZigReleaser = @import("ZigReleaser");
-const config = @import("ZigReleaser").config;
-const build_mod = @import("ZigReleaser").build;
-const parallel_build = @import("ZigReleaser").parallel_build;
+const TakeOff = @import("TakeOff");
+const config = @import("TakeOff").config;
+const build_mod = @import("TakeOff").build;
+const parallel_build = @import("TakeOff").parallel_build;
 
 const log = std.log.scoped(.main);
 
@@ -11,7 +11,7 @@ pub const WriteError = std.fs.File.WriteError;
 const MainError = error{
     OutOfMemory,
     WriteError,
-} || ZigReleaser.CliError;
+} || TakeOff.CliError;
 
 /// Build options parsed from CLI.
 pub const BuildOptions = struct {
@@ -32,9 +32,23 @@ pub const VerifyOptions = struct {
     /// Path to checksums file (null = auto-detect)
     checksums_file: ?[]const u8 = null,
     /// Hash algorithm (null = auto-detect from filename)
-    algorithm: ?ZigReleaser.checksum.HashAlgorithm = null,
+    algorithm: ?TakeOff.checksum.HashAlgorithm = null,
     /// Base directory for relative paths
     base_dir: ?[]const u8 = null,
+};
+
+/// Bump options parsed from CLI.
+pub const BumpOptions = struct {
+    /// Explicit version to set (overrides bump_type).
+    version: ?[]const u8 = null,
+    /// Semantic bump type: major, minor, patch.
+    bump_type: ?TakeOff.version.BumpType = null,
+    /// Show what would be done without writing files.
+    dry_run: bool = false,
+    /// Path to CHANGELOG.md (default: "CHANGELOG.md").
+    changelog_path: []const u8 = "CHANGELOG.md",
+    /// Path to build.zig.zon (default: "build.zig.zon").
+    zon_path: []const u8 = "build.zig.zon",
 };
 
 /// Release options parsed from CLI.
@@ -65,10 +79,11 @@ pub const Command = union(enum) {
     check,
     build: BuildOptions,
     verify: VerifyOptions,
+    bump: BumpOptions,
     release: ReleaseOptions,
 
     /// Parse CLI arguments into a Command. Returns `.help` for empty args.
-    pub fn fromArgs(allocator: std.mem.Allocator, args: []const []const u8) (ZigReleaser.CliError || std.mem.Allocator.Error)!Command {
+    pub fn fromArgs(allocator: std.mem.Allocator, args: []const []const u8) (TakeOff.CliError || std.mem.Allocator.Error)!Command {
         if (args.len == 0) return .help;
 
         const arg = args[0];
@@ -94,14 +109,14 @@ pub const Command = union(enum) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--file requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.checksums_file = try allocator.dupe(u8, args[i]);
                 } else if (std.mem.eql(u8, opt, "--algo") or std.mem.eql(u8, opt, "-a")) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--algo requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     const algo = args[i];
                     if (std.mem.eql(u8, algo, "sha256")) {
@@ -110,13 +125,13 @@ pub const Command = union(enum) {
                         options.algorithm = .blake3;
                     } else {
                         log.warn("invalid algorithm: {s} (must be sha256 or blake3)", .{algo});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                 } else if (std.mem.eql(u8, opt, "--dir") or std.mem.eql(u8, opt, "-d")) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--dir requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.base_dir = try allocator.dupe(u8, args[i]);
                 } else if (opt.len > 0 and opt[0] != '-') {
@@ -124,7 +139,7 @@ pub const Command = union(enum) {
                     options.checksums_file = try allocator.dupe(u8, opt);
                 } else {
                     log.err("unknown verify option: {s}", .{opt});
-                    return ZigReleaser.CliError.InvalidArguments;
+                    return TakeOff.CliError.InvalidArguments;
                 }
             }
             return Command{ .verify = options };
@@ -143,17 +158,17 @@ pub const Command = union(enum) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--jobs requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.jobs = std.fmt.parseInt(usize, args[i], 10) catch {
                         log.warn("invalid value for --jobs: {s}", .{args[i]});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     };
                 } else if (std.mem.eql(u8, opt, "--optimize") or std.mem.eql(u8, opt, "-O")) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--optimize requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     const opt_level = args[i];
                     if (!std.mem.eql(u8, opt_level, "Debug") and
@@ -162,7 +177,7 @@ pub const Command = union(enum) {
                         !std.mem.eql(u8, opt_level, "ReleaseSmall"))
                     {
                         log.warn("invalid optimize level: {s} (must be Debug, ReleaseSafe, ReleaseFast, or ReleaseSmall)", .{opt_level});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.optimize = try allocator.dupe(u8, opt_level);
                 } else if (std.mem.eql(u8, opt, "--verbose") or std.mem.eql(u8, opt, "-v")) {
@@ -173,18 +188,63 @@ pub const Command = union(enum) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--timeout requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.timeout = std.fmt.parseInt(u64, args[i], 10) catch {
                         log.err("invalid value for --timeout: {s}", .{args[i]});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     };
                 } else {
                     log.err("unknown build option: {s}", .{opt});
-                    return ZigReleaser.CliError.InvalidArguments;
+                    return TakeOff.CliError.InvalidArguments;
                 }
             }
             return Command{ .build = options };
+        }
+
+        if (std.mem.eql(u8, arg, "bump")) {
+            var options = BumpOptions{};
+            var i: usize = 1;
+            while (i < args.len) : (i += 1) {
+                const opt = args[i];
+                if (std.mem.eql(u8, opt, "--help") or std.mem.eql(u8, opt, "-h")) {
+                    return .help;
+                }
+                if (std.mem.eql(u8, opt, "--version") or std.mem.eql(u8, opt, "-v")) {
+                    i += 1;
+                    if (i >= args.len) {
+                        log.err("--version requires a value", .{});
+                        return TakeOff.CliError.InvalidArguments;
+                    }
+                    options.version = try allocator.dupe(u8, args[i]);
+                } else if (std.mem.eql(u8, opt, "--major")) {
+                    options.bump_type = .major;
+                } else if (std.mem.eql(u8, opt, "--minor")) {
+                    options.bump_type = .minor;
+                } else if (std.mem.eql(u8, opt, "--patch")) {
+                    options.bump_type = .patch;
+                } else if (std.mem.eql(u8, opt, "--dry-run")) {
+                    options.dry_run = true;
+                } else if (std.mem.eql(u8, opt, "--changelog") or std.mem.eql(u8, opt, "-c")) {
+                    i += 1;
+                    if (i >= args.len) {
+                        log.err("--changelog requires a value", .{});
+                        return TakeOff.CliError.InvalidArguments;
+                    }
+                    options.changelog_path = try allocator.dupe(u8, args[i]);
+                } else if (std.mem.eql(u8, opt, "--zon") or std.mem.eql(u8, opt, "-z")) {
+                    i += 1;
+                    if (i >= args.len) {
+                        log.err("--zon requires a value", .{});
+                        return TakeOff.CliError.InvalidArguments;
+                    }
+                    options.zon_path = try allocator.dupe(u8, args[i]);
+                } else {
+                    log.err("unknown bump option: {s}", .{opt});
+                    return TakeOff.CliError.InvalidArguments;
+                }
+            }
+            return Command{ .bump = options };
         }
 
         if (std.mem.eql(u8, arg, "release")) {
@@ -199,14 +259,14 @@ pub const Command = union(enum) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--tag requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.tag = try allocator.dupe(u8, args[i]);
                 } else if (std.mem.eql(u8, opt, "--notes") or std.mem.eql(u8, opt, "-n")) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--notes requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.notes = try allocator.dupe(u8, args[i]);
                 } else if (std.mem.eql(u8, opt, "--draft") or std.mem.eql(u8, opt, "-d")) {
@@ -223,26 +283,26 @@ pub const Command = union(enum) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--dist requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.dist_dir = try allocator.dupe(u8, args[i]);
                 } else if (std.mem.eql(u8, opt, "--changelog") or std.mem.eql(u8, opt, "-c")) {
                     i += 1;
                     if (i >= args.len) {
                         log.err("--changelog requires a value", .{});
-                        return ZigReleaser.CliError.InvalidArguments;
+                        return TakeOff.CliError.InvalidArguments;
                     }
                     options.changelog_path = try allocator.dupe(u8, args[i]);
                 } else {
                     log.err("unknown release option: {s}", .{opt});
-                    return ZigReleaser.CliError.InvalidArguments;
+                    return TakeOff.CliError.InvalidArguments;
                 }
             }
             return Command{ .release = options };
         }
 
         log.warn("unknown command: {s}", .{arg});
-        return ZigReleaser.CliError.UnknownCommand;
+        return TakeOff.CliError.UnknownCommand;
     }
 
     /// Free any allocated memory in the command.
@@ -268,6 +328,17 @@ pub const Command = union(enum) {
                 // Only free if we allocated the changelog_path string (not the default)
                 if (opts.changelog_path.ptr != "CHANGELOG.md".ptr) {
                     allocator.free(opts.changelog_path);
+                }
+            },
+            .bump => |opts| {
+                if (opts.version) |v| allocator.free(v);
+                // Only free if we allocated the changelog_path string (not the default)
+                if (opts.changelog_path.ptr != "CHANGELOG.md".ptr) {
+                    allocator.free(opts.changelog_path);
+                }
+                // Only free if we allocated the zon_path string (not the default)
+                if (opts.zon_path.ptr != "build.zig.zon".ptr) {
+                    allocator.free(opts.zon_path);
                 }
             },
             else => {},
@@ -315,7 +386,7 @@ fn executeCommand(allocator: std.mem.Allocator, io: std.Io, command: Command) u8
     switch (command) {
         .version => {
             var buf: [64]u8 = undefined;
-            const msg = std.fmt.bufPrint(&buf, "zr {s}\n", .{ZigReleaser.VERSION}) catch {
+            const msg = std.fmt.bufPrint(&buf, "takeoff {s}\n", .{TakeOff.VERSION}) catch {
                 log.err("version string too long", .{});
                 return 1;
             };
@@ -338,6 +409,9 @@ fn executeCommand(allocator: std.mem.Allocator, io: std.Io, command: Command) u8
         },
         .verify => |opts| {
             return executeVerify(allocator, io, opts);
+        },
+        .bump => |opts| {
+            return executeBump(allocator, io, opts);
         },
         .release => |opts| {
             return executeRelease(allocator, io, opts);
@@ -401,6 +475,42 @@ fn executeCheck(allocator: std.mem.Allocator, io: std.Io) u8 {
         const msg = std.fmt.allocPrint(allocator, "Config OK: {s}", .{config_path}) catch "Config OK";
         defer if (msg.ptr != "Config OK".ptr) allocator.free(msg);
         printCheckResult(out, .{ .state = .pass, .message = msg });
+    }
+
+    // Check version consistency between build.zig.zon and CHANGELOG.md
+    const zon_version: ?[]const u8 = TakeOff.version.readZonVersion(allocator, io, "build.zig.zon") catch |err| {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Version consistency ({s})", .{@errorName(err)}) catch "Version consistency (error)";
+        printCheckResult(out, .{ .state = .warn, .message = msg });
+        return finishCheck(out, required_failures);
+    };
+    defer if (zon_version) |v| allocator.free(v);
+
+    const changelog_version: ?[]const u8 = TakeOff.version.getLatestChangelogVersion(allocator, io, "CHANGELOG.md") catch |err| {
+        var msg_buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&msg_buf, "Version consistency ({s})", .{@errorName(err)}) catch "Version consistency (error)";
+        printCheckResult(out, .{ .state = .warn, .message = msg });
+        return finishCheck(out, required_failures);
+    };
+    defer if (changelog_version) |v| allocator.free(v);
+
+    if (zon_version) |zv| {
+        if (changelog_version) |cv| {
+            if (std.mem.eql(u8, zv, cv)) {
+                const msg = std.fmt.allocPrint(allocator, "Version consistent: {s} (build.zig.zon == CHANGELOG.md)", .{zv}) catch "Version consistent";
+                defer if (msg.ptr != "Version consistent".ptr) allocator.free(msg);
+                printCheckResult(out, .{ .state = .pass, .message = msg });
+            } else {
+                const msg = std.fmt.allocPrint(allocator, "Version mismatch: build.zig.zon={s}, CHANGELOG.md={s}", .{ zv, cv }) catch "Version mismatch";
+                defer if (msg.ptr != "Version mismatch".ptr) allocator.free(msg);
+                printCheckResult(out, .{ .state = .fail, .message = msg });
+                required_failures += 1;
+            }
+        } else {
+            const msg = std.fmt.allocPrint(allocator, "CHANGELOG.md has no version entries (build.zig.zon={s})", .{zv}) catch "No changelog versions";
+            defer if (msg.ptr != "No changelog versions".ptr) allocator.free(msg);
+            printCheckResult(out, .{ .state = .warn, .message = msg });
+        }
     }
 
     const required_zig_version = cfg.build.zig_version orelse "0.16.0";
@@ -523,7 +633,7 @@ fn checkGitHubToken(allocator: std.mem.Allocator, io: std.Io, cfg: config.Config
 
     // Use GitHubClient so the token check shares the same Io and benefits from
     // the configured connect timeout — no raw std.http.Client inline.
-    var client = ZigReleaser.publishers.GitHubClient.initWithOptions(
+    var client = TakeOff.publishers.GitHubClient.initWithOptions(
         allocator,
         io,
         token,
@@ -661,17 +771,17 @@ fn executeBuild(allocator: std.mem.Allocator, io: std.Io, opts: BuildOptions) u8
     const stderr = &stderr_writer.interface;
 
     // Load configuration
-    var cfg = ZigReleaser.config.loadDefault(allocator, io) catch |err| {
+    var cfg = TakeOff.config.loadDefault(allocator, io) catch |err| {
         stderr.print("Error: ", .{}) catch {};
-        ZigReleaser.config.formatParseError(err, stderr) catch {};
+        TakeOff.config.formatParseError(err, stderr) catch {};
         stderr.print("\n", .{}) catch {};
         return 1;
     };
 
     // Validate configuration
-    ZigReleaser.config.validate(&cfg) catch |err| {
+    TakeOff.config.validate(&cfg) catch |err| {
         stderr.print("Validation error: ", .{}) catch {};
-        ZigReleaser.config.formatValidationError(err, stderr) catch {};
+        TakeOff.config.formatValidationError(err, stderr) catch {};
         stderr.print("\n", .{}) catch {};
         return 1;
     };
@@ -684,7 +794,7 @@ fn executeBuild(allocator: std.mem.Allocator, io: std.Io, opts: BuildOptions) u8
 
     // Get version from git or use config version
     const version = blk: {
-        if (ZigReleaser.git.getVersion(allocator, io) catch null) |git_version| {
+        if (TakeOff.git.getVersion(allocator, io) catch null) |git_version| {
             break :blk git_version;
         }
         if (cfg.project.version) |v| {
@@ -749,7 +859,7 @@ fn executeBuild(allocator: std.mem.Allocator, io: std.Io, opts: BuildOptions) u8
     }
 
     // Generate packages
-    const package_summary = ZigReleaser.packager.generatePackages(
+    const package_summary = TakeOff.packager.generatePackages(
         allocator,
         io,
         cfg,
@@ -761,7 +871,7 @@ fn executeBuild(allocator: std.mem.Allocator, io: std.Io, opts: BuildOptions) u8
         stderr.print("Packaging failed: {}\n", .{err}) catch {};
         return 1;
     };
-    defer ZigReleaser.packager.freePackageSummary(allocator, @constCast(&package_summary));
+    defer TakeOff.packager.freePackageSummary(allocator, @constCast(&package_summary));
 
     // Print packaging summary if there were any packages
     if (package_summary.total > 0) {
@@ -789,7 +899,7 @@ fn executeVerify(allocator: std.mem.Allocator, io: std.Io, opts: VerifyOptions) 
     const stdout = &stdout_writer.interface;
     const stderr = &stderr_writer.interface;
 
-    const result = ZigReleaser.verify.verify(allocator, .{
+    const result = TakeOff.verify.verify(allocator, .{
         .checksums_file = opts.checksums_file,
         .algorithm = opts.algorithm,
         .base_dir = opts.base_dir,
@@ -799,7 +909,73 @@ fn executeVerify(allocator: std.mem.Allocator, io: std.Io, opts: VerifyOptions) 
     };
     defer result.deinit(allocator);
 
-    ZigReleaser.verify.printResult(result, stdout) catch {};
+    TakeOff.verify.printResult(result, stdout) catch {};
+
+    return 0;
+}
+
+fn executeBump(allocator: std.mem.Allocator, io: std.Io, opts: BumpOptions) u8 {
+    const stdout_file = std.Io.File.stdout();
+    const stderr_file = std.Io.File.stderr();
+    var stdout_buffer: [4096]u8 = undefined;
+    var stderr_buffer: [4096]u8 = undefined;
+    var stdout_writer = stdout_file.writer(io, &stdout_buffer);
+    var stderr_writer = stderr_file.writer(io, &stderr_buffer);
+    defer {
+        stdout_writer.interface.flush() catch {};
+        stderr_writer.interface.flush() catch {};
+    }
+    const stdout = &stdout_writer.interface;
+    const stderr = &stderr_writer.interface;
+
+    // Determine bump type for display
+    const bump_label: []const u8 = if (opts.version) |v| blk: {
+        var buf: [64]u8 = undefined;
+        break :blk std.fmt.bufPrint(&buf, "to {s}", .{v}) catch "to (version)";
+    } else if (opts.bump_type) |bt|
+        switch (bt) {
+            .major => "major",
+            .minor => "minor",
+            .patch => "patch",
+        }
+    else
+        "patch (default)";
+
+    if (opts.dry_run) {
+        stdout.print("Dry run - would bump version {s}\n", .{bump_label}) catch {};
+    }
+
+    const result = TakeOff.version.bumpVersion(allocator, io, .{
+        .version = opts.version,
+        .bump_type = opts.bump_type,
+        .dry_run = opts.dry_run,
+        .changelog_path = opts.changelog_path,
+        .zon_path = opts.zon_path,
+    }) catch |err| {
+        stderr.print("Error: Version bump failed: {s}\n", .{@errorName(err)}) catch {};
+        return 1;
+    };
+    defer result.deinit(allocator);
+
+    if (opts.dry_run) {
+        stdout.print("  {s} -> {s}\n", .{ result.old_version, result.new_version }) catch {};
+        stdout.print("  CHANGELOG.md has entry for {s}: {}\n", .{ result.new_version, result.changelog_has_section }) catch {};
+        stdout.print("  build.zig.zon would be updated: {}\n", .{result.zon_updated}) catch {};
+        return 0;
+    }
+
+    stdout.print("Bumped version {s} -> {s}\n", .{ result.old_version, result.new_version }) catch {};
+
+    if (result.zon_updated) {
+        stdout.print("  Updated build.zig.zon\n", .{}) catch {};
+    }
+
+    if (!result.changelog_has_section) {
+        stdout.print("  Warning: no CHANGELOG.md entry found for {s}\n", .{result.new_version}) catch {};
+        stdout.print("  Add a '## [v{s}]' section to CHANGELOG.md\n", .{result.new_version}) catch {};
+    } else {
+        stdout.print("  Verified CHANGELOG.md entry for {s}\n", .{result.new_version}) catch {};
+    }
 
     return 0;
 }
@@ -819,30 +995,30 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
     const stderr = &stderr_writer.interface;
 
     // Load configuration
-    var cfg = ZigReleaser.config.loadDefault(allocator, io) catch |err| {
+    var cfg = TakeOff.config.loadDefault(allocator, io) catch |err| {
         stderr.print("Error: ", .{}) catch {};
-        ZigReleaser.config.formatParseError(err, stderr) catch {};
+        TakeOff.config.formatParseError(err, stderr) catch {};
         stderr.print("\n", .{}) catch {};
         return 1;
     };
 
     // Validate configuration
-    ZigReleaser.config.validate(&cfg) catch |err| {
+    TakeOff.config.validate(&cfg) catch |err| {
         stderr.print("Validation error: ", .{}) catch {};
-        ZigReleaser.config.formatValidationError(err, stderr) catch {};
+        TakeOff.config.formatValidationError(err, stderr) catch {};
         stderr.print("\n", .{}) catch {};
         return 1;
     };
 
     // Check if GitHub release is configured
     const github_config = if (cfg.release) |r| r.github else {
-        stderr.print("Error: No GitHub release configuration found in zr.jsonc\n", .{}) catch {};
+        stderr.print("Error: No GitHub release configuration found in takeoff.jsonc\n", .{}) catch {};
         stderr.print("Add release.github with owner and repo fields\n", .{}) catch {};
         return 1;
     };
 
     if (github_config == null) {
-        stderr.print("Error: No GitHub release configuration found in zr.jsonc\n", .{}) catch {};
+        stderr.print("Error: No GitHub release configuration found in takeoff.jsonc\n", .{}) catch {};
         return 1;
     }
 
@@ -855,7 +1031,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             return 1;
         }
     else blk: {
-        if (ZigReleaser.git.getVersion(allocator, io) catch null) |git_version| {
+        if (TakeOff.git.getVersion(allocator, io) catch null) |git_version| {
             break :blk git_version;
         }
         stderr.print("Error: Could not determine tag from git. Use --tag to specify.\n", .{}) catch {};
@@ -864,7 +1040,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
     defer allocator.free(tag);
 
     // Verify tag exists
-    const tag_exists = ZigReleaser.git.tagExists(allocator, io, tag) catch |err| {
+    const tag_exists = TakeOff.git.tagExists(allocator, io, tag) catch |err| {
         stderr.print("Error: Failed to check if tag exists: {s}\n", .{@errorName(err)}) catch {};
         return 1;
     };
@@ -881,7 +1057,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             return 1;
         }
     else blk: {
-        if (ZigReleaser.changelog.extractVersionNotes(
+        if (TakeOff.changelog.extractVersionNotes(
             allocator,
             io,
             opts.changelog_path,
@@ -898,15 +1074,15 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
     defer allocator.free(notes);
 
     // Find artifacts to upload
-    const artifacts = ZigReleaser.changelog.findArtifacts(allocator, io, opts.dist_dir) catch |err| {
+    const artifacts = TakeOff.changelog.findArtifacts(allocator, io, opts.dist_dir) catch |err| {
         stderr.print("Error: Failed to find artifacts: {s}\n", .{@errorName(err)}) catch {};
         return 1;
     };
-    defer ZigReleaser.changelog.freeArtifacts(allocator, artifacts);
+    defer TakeOff.changelog.freeArtifacts(allocator, artifacts);
 
     if (artifacts.len == 0) {
         stderr.print("Error: No artifacts found in {s}\n", .{opts.dist_dir}) catch {};
-        stderr.print("Run 'zr build' first to generate artifacts.\n", .{}) catch {};
+        stderr.print("Run 'takeoff build' first to generate artifacts.\n", .{}) catch {};
         return 1;
     }
 
@@ -947,7 +1123,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 const aur_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
                 defer if (aur_url.ptr != "".ptr) allocator.free(aur_url);
 
-                const aur_opts = ZigReleaser.publishers.AurPublishOptions{
+                const aur_opts = TakeOff.publishers.AurPublishOptions{
                     .aur_repo = aur_cfg.?.repo,
                     .aur_ssh_key = aur_cfg.?.aur_ssh_key,
                     .owner = gh_cfg.owner,
@@ -961,7 +1137,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                     .dry_run = true,
                 };
 
-                var aur_result = ZigReleaser.publishers.publishAurPackage(allocator, io, aur_opts) catch |err| {
+                var aur_result = TakeOff.publishers.publishAurPackage(allocator, io, aur_opts) catch |err| {
                     stdout.print("\nAUR dry-run failed: {s}\n", .{@errorName(err)}) catch {};
                     return 0;
                 };
@@ -977,7 +1153,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
     }
 
     // Publish the release
-    const release_opts = ZigReleaser.publishers.ReleaseOptions{
+    const release_opts = TakeOff.publishers.ReleaseOptions{
         .owner = gh.owner,
         .repo = gh.repo,
         .tag = tag,
@@ -987,7 +1163,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
         .prerelease = opts.prerelease,
     };
 
-    const result = ZigReleaser.publishers.publishRelease(
+    const result = TakeOff.publishers.publishRelease(
         allocator,
         io,
         release_opts,
@@ -1019,7 +1195,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             const project_license = cfg.project.license orelse "unknown";
 
             const gh_cfg = cfg.release.?.github.?;
-            const aur_opts = ZigReleaser.publishers.AurPublishOptions{
+            const aur_opts = TakeOff.publishers.AurPublishOptions{
                 .aur_repo = aur_cfg.?.repo,
                 .aur_ssh_key = aur_cfg.?.aur_ssh_key,
                 .owner = gh_cfg.owner,
@@ -1034,7 +1210,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             };
             defer if (aur_opts.url.ptr != "".ptr) allocator.free(aur_opts.url);
 
-            var aur_result = ZigReleaser.publishers.publishAurPackage(allocator, io, aur_opts) catch |err| {
+            var aur_result = TakeOff.publishers.publishAurPackage(allocator, io, aur_opts) catch |err| {
                 stderr.print("Warning: AUR publish failed: {s}\n", .{@errorName(err)}) catch {};
                 return 0;
             };
@@ -1065,15 +1241,16 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
 }
 
 const usage =
-    \\zr - Release automation for Zig projects
+    \\takeoff - Release automation for Zig projects
     \\
     \\Usage:
-    \\  zr [OPTIONS] [COMMAND]
+    \\  takeoff [OPTIONS] [COMMAND]
     \\
     \\Commands:
-    \\  check            Validate zr.jsonc configuration
+    \\  check            Validate takeoff.jsonc configuration
     \\  build            Build all targets in parallel
     \\  verify           Verify checksums against checksums file
+    \\  bump             Bump version in build.zig.zon and CHANGELOG.md
     \\  release          Publish a GitHub release with artifacts
     \\
     \\Build Options:
@@ -1089,6 +1266,15 @@ const usage =
     \\  -f, --file       Path to checksums file
     \\  -a, --algo       Hash algorithm: sha256 or blake3 (auto-detect by default)
     \\  -d, --dir        Base directory for relative paths
+    \\
+    \\Bump Options:
+    \\  -v, --version V  Set explicit version (overrides bump type)
+    \\      --major      Bump major version (X.0.0)
+    \\      --minor      Bump minor version (0.X.0)
+    \\      --patch      Bump patch version (0.0.X, default)
+    \\      --dry-run    Show what would be done without writing
+    \\  -c, --changelog  Path to CHANGELOG.md (default: "CHANGELOG.md")
+    \\  -z, --zon PATH   Path to build.zig.zon (default: "build.zig.zon")
     \\
     \\Release Options:
     \\  -t, --tag TAG    Tag for release (default: git describe --tags)
@@ -1108,7 +1294,7 @@ const usage =
 ;
 
 test "VERSION is non-empty" {
-    try std.testing.expectEqualStrings("0.1.0", ZigReleaser.VERSION);
+    try std.testing.expect(TakeOff.VERSION.len > 0);
 }
 
 test "Command.fromArgs parses --version" {
@@ -1235,7 +1421,7 @@ test "Command.fromArgs returns error for unknown command" {
 
     const allocator = std.testing.allocator;
     try std.testing.expectError(
-        ZigReleaser.CliError.UnknownCommand,
+        TakeOff.CliError.UnknownCommand,
         Command.fromArgs(allocator, &[_][]const u8{"unknown"}),
     );
 }
@@ -1247,7 +1433,7 @@ test "Command.fromArgs returns error for invalid --jobs value" {
 
     const allocator = std.testing.allocator;
     try std.testing.expectError(
-        ZigReleaser.CliError.InvalidArguments,
+        TakeOff.CliError.InvalidArguments,
         Command.fromArgs(allocator, &[_][]const u8{ "build", "--jobs", "invalid" }),
     );
 }
@@ -1259,7 +1445,7 @@ test "Command.fromArgs returns error for invalid optimize level" {
 
     const allocator = std.testing.allocator;
     try std.testing.expectError(
-        ZigReleaser.CliError.InvalidArguments,
+        TakeOff.CliError.InvalidArguments,
         Command.fromArgs(allocator, &[_][]const u8{ "build", "--optimize", "Invalid" }),
     );
 }
@@ -1320,7 +1506,7 @@ test "Command.fromArgs parses verify with --algo sha256" {
     defer cmd.deinit(allocator);
     switch (cmd) {
         .verify => |opts| {
-            try std.testing.expectEqual(ZigReleaser.checksum.HashAlgorithm.sha256, opts.algorithm.?);
+            try std.testing.expectEqual(TakeOff.checksum.HashAlgorithm.sha256, opts.algorithm.?);
         },
         else => return error.UnexpectedCommand,
     }
@@ -1332,7 +1518,7 @@ test "Command.fromArgs parses verify with --algo blake3" {
     defer cmd.deinit(allocator);
     switch (cmd) {
         .verify => |opts| {
-            try std.testing.expectEqual(ZigReleaser.checksum.HashAlgorithm.blake3, opts.algorithm.?);
+            try std.testing.expectEqual(TakeOff.checksum.HashAlgorithm.blake3, opts.algorithm.?);
         },
         else => return error.UnexpectedCommand,
     }
@@ -1369,7 +1555,7 @@ test "Command.fromArgs parses verify with multiple options" {
     switch (cmd) {
         .verify => |opts| {
             try std.testing.expectEqualStrings("checksums.txt", opts.checksums_file.?);
-            try std.testing.expectEqual(ZigReleaser.checksum.HashAlgorithm.sha256, opts.algorithm.?);
+            try std.testing.expectEqual(TakeOff.checksum.HashAlgorithm.sha256, opts.algorithm.?);
             try std.testing.expectEqualStrings("dist", opts.base_dir.?);
         },
         else => return error.UnexpectedCommand,
@@ -1383,7 +1569,105 @@ test "Command.fromArgs returns error for invalid verify algo" {
 
     const allocator = std.testing.allocator;
     try std.testing.expectError(
-        ZigReleaser.CliError.InvalidArguments,
+        TakeOff.CliError.InvalidArguments,
         Command.fromArgs(allocator, &[_][]const u8{ "verify", "--algo", "md5" }),
     );
+}
+
+test "Command.fromArgs parses bump" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{"bump"});
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expect(opts.version == null);
+            try std.testing.expect(opts.bump_type == null);
+            try std.testing.expect(!opts.dry_run);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses bump --major" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "bump", "--major" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expect(opts.bump_type == .major);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses bump --minor" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "bump", "--minor" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expect(opts.bump_type == .minor);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses bump --patch" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "bump", "--patch" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expect(opts.bump_type == .patch);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses bump --version" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "bump", "--version", "1.0.0" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expectEqualStrings("1.0.0", opts.version.?);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses bump --dry-run" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "bump", "--dry-run" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expect(opts.dry_run);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses bump --changelog" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "bump", "--changelog", "docs/CHANGELOG.md" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expectEqualStrings("docs/CHANGELOG.md", opts.changelog_path);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses bump --zon" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "bump", "--zon", "custom.zon" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .bump => |opts| {
+            try std.testing.expectEqualStrings("custom.zon", opts.zon_path);
+        },
+        else => return error.UnexpectedCommand,
+    }
 }

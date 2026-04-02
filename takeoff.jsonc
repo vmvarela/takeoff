@@ -1,7 +1,7 @@
 {
     // Project metadata
     "project": {
-        "name": "zr",
+        "name": "takeoff",
         "description": "Release automation for Zig projects",
         "license": "MIT"
     },
@@ -36,14 +36,14 @@
             "summary": "Release automation for Zig projects",
             "license": "MIT",
             "packager": "Victor M. Varela <vmvarela@gmail.com>",
-            "url": "https://github.com/vmvarela/zr"
+            "url": "https://github.com/vmvarela/takeoff"
         },
         // .apk packages are generated for Linux targets only (Alpine Linux)
         "apk": {
             "description": "Release automation for Zig projects",
             "license": "MIT",
             "maintainer": "Victor M. Varela <vmvarela@gmail.com>",
-            "url": "https://github.com/vmvarela/zr"
+            "url": "https://github.com/vmvarela/takeoff"
         }
     },
 
@@ -51,10 +51,10 @@
     "release": {
         "github": {
             "owner": "vmvarela",
-            "repo": "zr"
+            "repo": "takeoff"
         },
         "aur": {
-            "repo": "zr-bin"
+            "repo": "takeoff-bin"
             // Optional: path to AUR SSH key for push
             // "aur_ssh_key": "/home/you/.ssh/aur"
         }

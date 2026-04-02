@@ -1,9 +1,9 @@
 const std = @import("std");
 const build_options = @import("build_options");
 
-const log = std.log.scoped(.ZigReleaser);
+const log = std.log.scoped(.TakeOff);
 
-/// Version of zr, injected at build time from build.zig.zon.
+/// Version of takeoff, injected at build time from build.zig.zon.
 pub const VERSION: []const u8 = build_options.version;
 
 pub const config = @import("config.zig");
@@ -17,6 +17,7 @@ pub const packagers = @import("packagers/mod.zig");
 pub const checksum = @import("checksum.zig");
 pub const verify = @import("verify.zig");
 pub const changelog = @import("changelog.zig");
+pub const version = @import("version.zig");
 pub const publishers = @import("publishers/mod.zig");
 
 pub const CliError = error{

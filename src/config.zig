@@ -160,12 +160,12 @@ pub const Config = struct {
 };
 
 const config_paths = [_][]const u8{
-    "zr.json",
-    "zr.jsonc",
-    ".zr.json",
-    ".zr.jsonc",
-    ".config/zr.json",
-    ".config/zr.jsonc",
+    "takeoff.json",
+    "takeoff.jsonc",
+    ".takeoff.json",
+    ".takeoff.jsonc",
+    ".config/takeoff.json",
+    ".config/takeoff.jsonc",
 };
 
 pub fn find(allocator: std.mem.Allocator, io: std.Io) ParseError![]const u8 {
@@ -935,14 +935,14 @@ test "load parses valid JSONC config with comments" {
     try std.testing.expectEqual(@as(usize, 1), config.targets.len);
 }
 
-test "find discovers zr.json in current directory" {
+test "find discovers takeoff.json in current directory" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "zr.json", .data = "{\"project\":{\"name\":\"test\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "takeoff.json", .data = "{\"project\":{\"name\":\"test\"}}" });
 
     var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer original_cwd.close(io);
@@ -955,17 +955,17 @@ test "find discovers zr.json in current directory" {
     };
     defer allocator.free(path);
 
-    try std.testing.expect(std.mem.eql(u8, path, "zr.json"));
+    try std.testing.expect(std.mem.eql(u8, path, "takeoff.json"));
 }
 
-test "find discovers zr.jsonc in current directory" {
+test "find discovers takeoff.jsonc in current directory" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "zr.jsonc", .data = "{//config\n\"project\":{\"name\":\"test\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "takeoff.jsonc", .data = "{//config\n\"project\":{\"name\":\"test\"}}" });
 
     var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
     defer original_cwd.close(io);
@@ -978,5 +978,5 @@ test "find discovers zr.jsonc in current directory" {
     };
     defer allocator.free(path);
 
-    try std.testing.expect(std.mem.eql(u8, path, "zr.jsonc"));
+    try std.testing.expect(std.mem.eql(u8, path, "takeoff.jsonc"));
 }

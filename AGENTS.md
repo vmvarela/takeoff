@@ -1,8 +1,8 @@
-# AGENTS.md — AI Coding Assistant Guide for zr
+# AGENTS.md — AI Coding Assistant Guide for takeoff
 
 ## Project overview
 
-`zr` is a release automation tool for Zig projects. It cross-compiles binaries for all targets on a single Linux runner, then packages them into native formats for each OS/distribution.
+`takeoff` is a release automation tool for Zig projects. It cross-compiles binaries for all targets on a single Linux runner, then packages them into native formats for each OS/distribution.
 
 ## Repository structure
 
@@ -10,11 +10,11 @@
 - `src/packagers/` — one file per package format (.deb, .rpm, etc.)
 - `src/publishers/` — GitHub, AUR, Homebrew tap publishers
 - `build.zig` — the project build file
-- `zr.jsonc` — zr's own release config (dogfooding)
+- `takeoff.jsonc` — takeoff's own release config (dogfooding)
 
 ## Key constraints
 
-- Minimum Zig version: 0.14.0
+- Minimum Zig version: 0.16.0
 - Zero runtime dependencies — no libc, no OpenSSL, no libcurl
 - All package formats must be generatable from Linux
 - std.crypto for all hashing (SHA-256, BLAKE3)

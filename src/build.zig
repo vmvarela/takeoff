@@ -23,7 +23,7 @@ pub const BuildTarget = struct {
     cpu: ?[]const u8,
     /// The target triple string for Zig (e.g., "x86_64-linux-gnu")
     target_string: []const u8,
-    /// The output path/name for packaging (e.g., "zr-x86_64-linux")
+    /// The output path/name for packaging (e.g., "takeoff-x86_64-linux")
     output_path: []const u8,
     /// The project name (used to find the binary zig actually produces)
     project_name: []const u8,

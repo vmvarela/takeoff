@@ -161,7 +161,7 @@ test "stripComments handles complex JSONC" {
     const input =
         \\{
         \\  "project": {
-        \\    "name": "zr", // project name
+        \\    "name": "takeoff", // project name
         \\    /* description
         \\       multiline */
         \\    "version": "1.0"
@@ -171,7 +171,7 @@ test "stripComments handles complex JSONC" {
     const expected =
         \\{
         \\  "project": {
-        \\    "name": "zr", 
+        \\    "name": "takeoff", 
         \\    
         \\    "version": "1.0"
         \\  }

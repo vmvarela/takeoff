@@ -8,8 +8,8 @@ All notable changes to this project will be documented in this file.
 
 - Native Alpine `.apk` packager for Linux targets, wired into the packaging pipeline and checksum generation
 - Native Arch Linux AUR publisher support with generated `PKGBUILD` and `.SRCINFO`
-- `zr release --aur` to generate/update AUR metadata and optionally push to AUR via SSH
-- `release.aur` configuration block in `zr.jsonc` with `repo` and optional `aur_ssh_key`
+- `takeoff release --aur` to generate/update AUR metadata and optionally push to AUR via SSH
+- `release.aur` configuration block in `takeoff.jsonc` with `repo` and optional `aur_ssh_key`
 
 ### Fixed
 
@@ -19,7 +19,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - Release artifact discovery now includes `.deb`, `.rpm`, and `.apk` files
-- `zr check` optional tools list now includes `namcap`
+- `takeoff check` optional tools list now includes `namcap`
 
 ## [v0.1.0] - 2026-03-29
 
@@ -27,9 +27,9 @@ All notable changes to this project will be documented in this file.
 
 - Cross-compile binaries for Linux x86_64, macOS aarch64/x86_64, and Windows x86_64 from a single runner
 - Parallel builds via `std.Io.Group` — all targets built concurrently
-- `zr build` — cross-compile all targets and produce `.tar.gz` / `.zip` archives with checksums
-- `zr verify` — verify SHA-256 and BLAKE3 checksums against a checksums file
-- `zr release` — publish a GitHub Release via API and upload artifacts
-- `zr check` — pre-flight validation: config, zig version, GITHUB_TOKEN, dry-run builds per target, optional tools
-- JSONC config (`zr.jsonc`) with full support for targets, packages, and GitHub release settings
+- `takeoff build` — cross-compile all targets and produce `.tar.gz` / `.zip` archives with checksums
+- `takeoff verify` — verify SHA-256 and BLAKE3 checksums against a checksums file
+- `takeoff release` — publish a GitHub Release via API and upload artifacts
+- `takeoff check` — pre-flight validation: config, zig version, GITHUB_TOKEN, dry-run builds per target, optional tools
+- JSONC config (`takeoff.jsonc`) with full support for targets, packages, and GitHub release settings
 - Zero runtime dependencies: no libc, no OpenSSL, no libcurl — pure Zig stdlib

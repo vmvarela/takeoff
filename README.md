@@ -1,12 +1,12 @@
-# zr
+# takeoff
 
 **Release automation for Zig projects. Cross-compile once, package everywhere.**
 
 ## What is this?
 
-Zig can cross-compile to any target from a single machine — no Docker containers, no remote builders, no platform-specific CI configurations. `zr` automates this into a complete release pipeline: build all your binaries in parallel, package them for different package managers, and publish to GitHub Releases with a single command.
+Zig can cross-compile to any target from a single machine — no Docker containers, no remote builders, no platform-specific CI configurations. `takeoff` automates this into a complete release pipeline: build all your binaries in parallel, package them for different package managers, and publish to GitHub Releases with a single command.
 
-I built this after the third time I found myself manually uploading tarballs to GitHub Releases. The workflow should be: tag a commit, run `zr release`, done.
+I built this after the third time I found myself manually uploading tarballs to GitHub Releases. The workflow should be: tag a commit, run `takeoff release`, done.
 
 **Status:** pre-alpha — core functionality works but API may change
 
@@ -17,18 +17,18 @@ I built this after the third time I found myself manually uploading tarballs to 
 zig build --release=safe
 
 # Verify your setup
-zr check
+takeoff check
 
 # Build for all configured targets
-zr build
+takeoff build
 
 # Publish a release (requires GITHUB_TOKEN)
-zr release
+takeoff release
 ```
 
 ## Configuration
 
-Create `zr.jsonc` in your project root:
+Create `takeoff.jsonc` in your project root:
 
 ```jsonc
 {
@@ -68,26 +68,27 @@ Create `zr.jsonc` in your project root:
 
 ### Configuration paths
 
-`zr` looks for config in this order:
-1. `zr.json`
-2. `zr.jsonc` (with comments)
-3. `.zr.json`
-4. `.zr.jsonc`
-5. `.config/zr.json`
-6. `.config/zr.jsonc`
+`takeoff` looks for config in this order:
+1. `takeoff.json`
+2. `takeoff.jsonc` (with comments)
+3. `.takeoff.json`
+4. `.takeoff.jsonc`
+5. `.config/takeoff.json`
+6. `.config/takeoff.jsonc`
 
 ## Commands
 
-### `zr check`
+### `takeoff check`
 
 Validates your configuration and environment:
 
 ```
 Pre-flight checks
 ================
-✓ Config OK: zr.jsonc
+✓ Config OK: takeoff.jsonc
+✓ Version consistent: 0.2.0 (build.zig.zon == CHANGELOG.md)
 ✓ zig version OK: 0.16.0 (required >= 0.16.0)
-✓ GITHUB_TOKEN OK: can access vmvarela/zr
+✓ GITHUB_TOKEN OK: can access vmvarela/takeoff
 ✓ dry-run target OK: x86_64-linux
 
 Optional tools
@@ -97,68 +98,91 @@ Optional tools
 ✓ gpg
 ```
 
-### `zr build`
+### `takeoff build`
 
 Compiles your project for all targets in parallel:
 
 ```bash
 # Build with defaults
-zr build
+takeoff build
 
 # Build with 8 parallel jobs
-zr build -j 8
+takeoff build -j 8
 
 # Build for smaller binaries
-zr build -O ReleaseSmall
+takeoff build -O ReleaseSmall
 
 # See what would be built without building
-zr build --dry-run
+takeoff build --dry-run
 ```
 
-### `zr release`
+### `takeoff release`
 
 Publishes artifacts to GitHub Releases:
 
 ```bash
 # Release current git tag
-GITHUB_TOKEN=xxx zr release
+GITHUB_TOKEN=xxx takeoff release
 
 # Release specific tag
-zr release --tag v1.0.0
+takeoff release --tag v1.0.0
 
 # Create a draft release
-zr release --draft
+takeoff release --draft
 
 # Replace existing assets
-zr release --clean-assets
+takeoff release --clean-assets
 
 # Also generate/publish AUR metadata (requires release.aur config)
-zr release --aur
+takeoff release --aur
 ```
 
 Requires `GITHUB_TOKEN` environment variable with `repo` scope.
 
 For AUR publishing (`--aur`), configure `release.aur.repo` and optionally
-`release.aur.aur_ssh_key` in `zr.jsonc` (or set `AUR_SSH_KEY` env var).
+`release.aur.aur_ssh_key` in `takeoff.jsonc` (or set `AUR_SSH_KEY` env var).
 
-### `zr verify`
+### `takeoff verify`
 
 Verifies checksums against a checksums file:
 
 ```bash
 # Auto-detect checksums file and algorithm
-zr verify
+takeoff verify
 
 # Verify specific file with SHA-256
-zr verify -f checksums-sha256.txt -a sha256
+takeoff verify -f checksums-sha256.txt -a sha256
 ```
+
+### `takeoff bump`
+
+Bumps the project version in `build.zig.zon` and verifies that `CHANGELOG.md` has a matching entry:
+
+```bash
+# Bump patch version (default)
+takeoff bump
+
+# Bump minor or major
+takeoff bump --minor
+takeoff bump --major
+
+# Set explicit version
+takeoff bump --version 1.0.0
+
+# Preview without writing files
+takeoff bump --dry-run
+```
+
+This keeps the two version sources in sync. The release process reads the version from `git describe --tags`, but `build.zig.zon` is what `zig build` uses for `TakeOff.VERSION`. Run `bump` before tagging a release.
+
+`takeoff check` will warn if `build.zig.zon` and `CHANGELOG.md` have different versions.
 
 ## Under the Hood
 
-`zr` is built on Zig's native cross-compilation and the stdlib's HTTP client. No libcurl, no external dependencies.
+`takeoff` is built on Zig's native cross-compilation and the stdlib's HTTP client. No libcurl, no external dependencies.
 
 **Build process:**
-1. Parse `zr.jsonc` and validate against your installed Zig version
+1. Parse `takeoff.jsonc` and validate against your installed Zig version
 2. Create a thread pool (default: CPU count)
 3. Spawn `zig build` for each target with `-Dtarget=...`
 4. Collect artifacts into `dist/` directory
@@ -168,15 +192,15 @@ zr verify -f checksums-sha256.txt -a sha256
 
 **GitHub integration** uses `std.http.Client` directly. The only external requirement is the `GITHUB_TOKEN` environment variable.
 
-## Why `zr` over alternatives?
+## Why `takeoff` over alternatives?
 
 | Tool | Cross-compilation | Packaging | GitHub Releases | Zero dependencies |
 |------|-------------------|-----------|-----------------|-------------------|
 | GoReleaser | Needs toolchains | Yes | Yes | No (Go + libs) |
 | cargo-dist | Native | Yes | Yes | No (Rust toolchain) |
-| **zr** | **Native** | **Yes** | **Yes** | **Yes** |
+| **takeoff** | **Native** | **Yes** | **Yes** | **Yes** |
 
-GoReleaser and cargo-dist are excellent tools for their ecosystems. Use `zr` when:
+GoReleaser and cargo-dist are excellent tools for their ecosystems. Use `takeoff` when:
 - You're releasing a Zig project
 - You want builds to work on any machine with just Zig installed
 - You need packaging without running Docker containers

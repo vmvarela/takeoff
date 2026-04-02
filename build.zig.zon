@@ -1,7 +1,7 @@
 .{
-    .name = .zig_releaser,
-    .version = "0.1.0",
-    .fingerprint = 0x6a529dc7d8b8225e,
+    .name = .takeoff,
+    .version = "0.2.0",
+    .fingerprint = 0x700432851e8b7674,
     .minimum_zig_version = "0.16.0-dev.3028+a85495ca2",
     .paths = .{
         "build.zig",

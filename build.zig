@@ -10,21 +10,21 @@ pub fn build(b: *std.Build) void {
     const options = b.addOptions();
     options.addOption([]const u8, "version", version);
 
-    const zig_releaser_mod = b.addModule("ZigReleaser", .{
-        .root_source_file = b.path("src/ZigReleaser.zig"),
+    const takeoff_mod = b.addModule("TakeOff", .{
+        .root_source_file = b.path("src/TakeOff.zig"),
         .target = target,
         .optimize = optimize,
     });
-    zig_releaser_mod.addOptions("build_options", options);
+    takeoff_mod.addOptions("build_options", options);
 
     const exe = b.addExecutable(.{
-        .name = "zr",
+        .name = "takeoff",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ZigReleaser", .module = zig_releaser_mod },
+                .{ .name = "TakeOff", .module = takeoff_mod },
             },
         }),
     });
@@ -46,13 +46,13 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "ZigReleaser", .module = zig_releaser_mod },
+                .{ .name = "TakeOff", .module = takeoff_mod },
             },
         }),
     });
 
     const lib_unit_tests = b.addTest(.{
-        .root_module = zig_releaser_mod,
+        .root_module = takeoff_mod,
     });
 
     // Per-module test binaries for modules with their own tests
@@ -66,6 +66,7 @@ pub fn build(b: *std.Build) void {
         "src/verify.zig",
         "src/changelog.zig",
         "src/progress.zig",
+        "src/version.zig",
     };
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
@@ -82,7 +83,7 @@ pub fn build(b: *std.Build) void {
                 .target = target,
                 .optimize = optimize,
                 .imports = &.{
-                    .{ .name = "ZigReleaser", .module = zig_releaser_mod },
+                    .{ .name = "TakeOff", .module = takeoff_mod },
                 },
             }),
         });
