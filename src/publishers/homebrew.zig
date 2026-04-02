@@ -148,6 +148,7 @@ pub fn publishHomebrewFormula(
     defer if (ssh_key) |k| allocator.free(k);
 
     if (ssh_key == null) {
+        log.warn("tap push skipped: no SSH key found — set 'tap_ssh_key' in takeoff.jsonc or the HOMEBREW_TAP_SSH_KEY environment variable", .{});
         const msg = try allocator.dupe(
             u8,
             "generated formula; tap push skipped (no tap_ssh_key and no HOMEBREW_TAP_SSH_KEY)",
