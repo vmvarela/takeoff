@@ -144,6 +144,13 @@ pub fn renderFormula(
     const completion_blocks = try renderCompletions(allocator, cfg.completions);
     defer allocator.free(completion_blocks);
 
+    // Build the install body: bin.install + optional man + completions
+    const extra_installs = if (man_block.len > 0 or completion_blocks.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}{s}", .{ man_block, completion_blocks })
+    else
+        "";
+    defer if (man_block.len > 0 or completion_blocks.len > 0) allocator.free(extra_installs);
+
     return std.fmt.allocPrint(allocator,
         \\class {s} < Formula
         \\  desc "{s}"
@@ -156,8 +163,7 @@ pub fn renderFormula(
         \\  depends_on :macos
         \\
         \\  def install
-        \\    bin.install "bin/{s}"
-        \\{s}{s}
+        \\    bin.install "bin/{s}"{s}
         \\  end
         \\
         \\  test do
@@ -174,8 +180,7 @@ pub fn renderFormula(
         cfg.license,
         head_block,
         cfg.project_name,
-        man_block,
-        completion_blocks,
+        extra_installs,
         cfg.project_name,
     });
 }
