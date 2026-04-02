@@ -44,12 +44,12 @@
             "license": "MIT",
             "maintainer": "Victor M. Varela <vmvarela@gmail.com>",
             "url": "https://github.com/vmvarela/takeoff"
-        }
+        },
         // Homebrew formula — shared tap repo for all projects
-        // "homebrew": {
-        //     "tap": "vmvarela/homebrew-tap"
-        //     // Optional: "tap_ssh_key": "/home/you/.ssh/homebrew-tap"
-        // }
+        "homebrew": {
+            "tap": "vmvarela/homebrew-tap"
+            // Optional: "tap_ssh_key": "/home/you/.ssh/homebrew-tap"
+        }
     },
 
     // GitHub Release configuration

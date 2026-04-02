@@ -424,7 +424,7 @@ fn executeCommand(allocator: std.mem.Allocator, io: std.Io, command: Command) u8
     return 0;
 }
 
-const CheckState = enum { pass, fail, warn };
+const CheckState = enum { pass, fail, warn, skip };
 
 const CheckResult = struct {
     state: CheckState,
@@ -436,6 +436,7 @@ fn printCheckResult(writer: *std.Io.Writer, result: CheckResult) void {
         .pass => "✓",
         .fail => "✗",
         .warn => "!",
+        .skip => "–",
     };
     writer.print("{s} {s}\n", .{ symbol, result.message }) catch {};
 }
@@ -559,8 +560,8 @@ fn executeCheck(allocator: std.mem.Allocator, io: std.Io) u8 {
         if (!dry_run_result.ok) required_failures += 1;
     }
 
-    out.writeAll("\nOptional tools\n") catch {};
-    out.writeAll("--------------\n") catch {};
+    out.writeAll("\nOptional tools (none required — takeoff generates all packages natively)\n") catch {};
+    out.writeAll("------------------------------------------------------------------------\n") catch {};
     const optional_tools = [_][]const u8{
         "appimagetool",
         "wixl",
@@ -576,7 +577,8 @@ fn executeCheck(allocator: std.mem.Allocator, io: std.Io) u8 {
         const available = commandExists(allocator, io, tool);
         const msg = std.fmt.allocPrint(allocator, "{s}", .{tool}) catch tool;
         defer if (msg.ptr != tool.ptr) allocator.free(msg);
-        printCheckResult(out, .{ .state = if (available) .pass else .warn, .message = msg });
+        // Use .pass for available, .skip for unavailable (not a warning)
+        printCheckResult(out, .{ .state = if (available) .pass else .skip, .message = msg });
     }
 
     return finishCheck(out, required_failures);
