@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.3.0] - 2026-04-02
+
+### Added
+
+- Native Homebrew formula generation — produces a valid Ruby `.rb` formula with tarball URL, sha256, and `head` install support
+- Homebrew tap publisher — clones a shared tap repo, writes `Formula/<name>.rb`, commits and pushes via SSH
+- `takeoff release --homebrew` flag to generate and publish a Homebrew formula alongside a GitHub release
+- `packages.homebrew` configuration block in `takeoff.jsonc` with `tap`, `tap_ssh_key`, `description`, and `homepage` options
+- `takeoff bump` command to synchronise version between `build.zig.zon` and `CHANGELOG.md` with `--major`, `--minor`, `--patch`, `--version`, and `--dry-run` options
+- Version consistency check in `takeoff check` — warns when `build.zig.zon` and `CHANGELOG.md` have different versions
+
+### Changed
+
+- `takeoff check` optional tools section now clarifies that none are required and uses a neutral symbol for unavailable tools
+
+### Fixed
+
+- `takeoff release --clean-assets` now properly deletes old assets before uploading new ones
+- Homebrew formula template passes `brew audit --strict` with no warnings
+
 ## [v0.2.0] - 2026-03-31
 
 ### Added
