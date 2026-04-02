@@ -2,6 +2,7 @@ const std = @import("std");
 
 const github = @import("github.zig");
 const aur = @import("aur.zig");
+const homebrew = @import("homebrew.zig");
 
 pub const GitHubClient = github.GitHubClient;
 pub const ReleaseOptions = github.ReleaseOptions;
@@ -15,6 +16,10 @@ pub const AurPublishOptions = aur.AurPublishOptions;
 pub const AurPublishResult = aur.AurPublishResult;
 pub const AurError = aur.AurError;
 pub const publishAurPackage = aur.publishAurPackage;
+pub const HomebrewPublishOptions = homebrew.HomebrewPublishOptions;
+pub const HomebrewPublishResult = homebrew.HomebrewPublishResult;
+pub const HomebrewPublishError = homebrew.HomebrewPublishError;
+pub const publishHomebrewFormula = homebrew.publishHomebrewFormula;
 
 pub const GitHubErrorCode = enum {
     none,
@@ -48,4 +53,8 @@ test "module exports" {
     _ = AurPublishResult;
     _ = AurError;
     _ = publishAurPackage;
+    _ = HomebrewPublishOptions;
+    _ = HomebrewPublishResult;
+    _ = HomebrewPublishError;
+    _ = publishHomebrewFormula;
 }

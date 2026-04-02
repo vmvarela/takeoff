@@ -123,11 +123,29 @@ pub const RpmPackage = struct {
     }
 };
 
+/// Configuration for generating a Homebrew formula (macOS/Linux).
+pub const HomebrewPackage = struct {
+    /// Tap repository — "owner/tap-repo" or just "tap-repo".
+    /// The formula is written to Formula/<name>.rb inside this repo.
+    tap: ?[]const u8 = null,
+    /// Override the default description (falls back to project.description).
+    description: ?[]const u8 = null,
+    /// Override the default homepage (falls back to GitHub repo URL).
+    homepage: ?[]const u8 = null,
+    /// Tap SSH key for pushing (falls back to HOMEBREW_TAP_SSH_KEY env).
+    tap_ssh_key: ?[]const u8 = null,
+
+    pub fn getTap(self: @This()) []const u8 {
+        return self.tap orelse "";
+    }
+};
+
 pub const Packages = struct {
     tarball: ?TarballPackage = null,
     deb: ?DebPackage = null,
     rpm: ?RpmPackage = null,
     apk: ?ApkPackage = null,
+    homebrew: ?HomebrewPackage = null,
 };
 
 pub const GitHubRelease = struct {
@@ -253,7 +271,13 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .maintainer = try dupeOptStr(allocator, a.maintainer),
             .url = try dupeOptStr(allocator, a.url),
         } else null;
-        break :blk Packages{ .tarball = tarball, .deb = deb, .rpm = rpm, .apk = apk };
+        const homebrew: ?HomebrewPackage = if (pkg.homebrew) |hb| HomebrewPackage{
+            .tap = try dupeOptStr(allocator, hb.tap),
+            .description = try dupeOptStr(allocator, hb.description),
+            .homepage = try dupeOptStr(allocator, hb.homepage),
+            .tap_ssh_key = try dupeOptStr(allocator, hb.tap_ssh_key),
+        } else null;
+        break :blk Packages{ .tarball = tarball, .deb = deb, .rpm = rpm, .apk = apk, .homebrew = homebrew };
     } else null;
 
     const release: ?Release = if (src.release) |rel| blk: {
