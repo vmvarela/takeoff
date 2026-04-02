@@ -288,19 +288,8 @@ pub const GitHubClient = struct {
             return error.ParseError;
         };
 
-        const protocol = std.http.Client.Protocol.fromUri(uri) orelse {
-            log.err("unsupported URI scheme", .{});
-            return error.NetworkError;
-        };
-
-        // Pin the per-request deadline NOW so that connect + future send/receive
-        // phases all count against the same budget.
-        const request_deadline = self.request_timeout.toDeadline(self.io);
-        const connection = try self.connectWithTimeout(uri, protocol, request_deadline);
-
         var req = self.http_client.request(method, uri, .{
             .extra_headers = headers,
-            .connection = connection,
         }) catch |err| {
             log.err("failed to create request: {}", .{err});
             return error.NetworkError;
@@ -685,17 +674,8 @@ pub const GitHubClient = struct {
             return error.ParseError;
         };
 
-        const protocol = std.http.Client.Protocol.fromUri(uri) orelse {
-            log.err("unsupported URI scheme", .{});
-            return error.NetworkError;
-        };
-        // Pin the per-request deadline NOW (same pattern as makeRequestRaw).
-        const request_deadline = self.request_timeout.toDeadline(self.io);
-        const connection = try self.connectWithTimeout(uri, protocol, request_deadline);
-
         var req = self.http_client.request(.POST, uri, .{
             .extra_headers = headers,
-            .connection = connection,
         }) catch |err| {
             log.err("failed to create request: {}", .{err});
             return error.NetworkError;

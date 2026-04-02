@@ -2,6 +2,25 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.2.0] - 2026-03-31
+
+### Added
+
+- Native Alpine `.apk` packager for Linux targets, wired into the packaging pipeline and checksum generation
+- Native Arch Linux AUR publisher support with generated `PKGBUILD` and `.SRCINFO`
+- `zr release --aur` to generate/update AUR metadata and optionally push to AUR via SSH
+- `release.aur` configuration block in `zr.jsonc` with `repo` and optional `aur_ssh_key`
+
+### Fixed
+
+- APK payload compatibility with `apk-tools` by adding required per-file PAX checksum headers and correct data tar paths
+- GitHub release client panic on network/TLS edge path by using the safer request connection flow
+
+### Changed
+
+- Release artifact discovery now includes `.deb`, `.rpm`, and `.apk` files
+- `zr check` optional tools list now includes `namcap`
+
 ## [v0.1.0] - 2026-03-29
 
 ### Added
