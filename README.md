@@ -1,5 +1,8 @@
-# takeoff
+<p align="center">
+  <img src="./logo.png" alt="takeoff logo" />
+</p>
 
+# takeoff
 **Release automation for Zig projects. Cross-compile once, package everywhere.**
 
 ## What is this?
