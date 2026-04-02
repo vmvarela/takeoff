@@ -41,3 +41,34 @@
 3. Expose `pub fn generate(config: Config, artifacts: []Artifact) !void`
 4. Add unit tests for the generated file structure
 5. Validate with the native tool if available (dpkg-deb, rpm, apk, etc.)
+
+## Zig 0.16 API notes
+
+This project targets Zig 0.16.0-dev. Several stdlib APIs changed from earlier
+versions. Use the patterns below — do not use the old equivalents.
+
+| What you want | Zig 0.16 API | Old / wrong |
+|---|---|---|
+| Empty ArrayList | `var list: std.ArrayList(T) = .empty;` | `.init(allocator)` |
+| Append slice to ArrayList | `list.appendSlice(allocator, items)` | `list.appendSlice(items)` |
+| Trim leading whitespace | `std.mem.trim(u8, s, " \t")` | `std.mem.trimLeft` (removed) |
+| Trim trailing whitespace | `std.mem.trim(u8, s, " \t")` | `std.mem.trimRight` (removed) |
+| Format into ArrayList | Use `appendSlice` + `std.fmt.allocPrint` | `std.fmt.format(list.writer(allocator), ...)` |
+| Free optional string | `if (opt) |v| allocator.free(v);` | `allocator.free(opt)` (type error) |
+| Discard a value | `_ = value;` | `value;` (compile error) |
+
+### Common gotchas
+
+- **`std.ArrayList` is unmanaged by default** in 0.16. Use `.empty` to
+  initialise and always pass the allocator to mutating methods.
+- **`std.mem.trimLeft` / `std.mem.trimRight` were removed.** Use
+  `std.mem.trim(u8, slice, cutset)` — it trims both sides. If you need
+  one-sided trimming, slice the result yourself.
+- **`std.fmt.format(writer, ...)` no longer works on `ArrayList.writer()`.**
+  Build the string with `std.fmt.allocPrint` then `appendSlice`, or use
+  `std.io.fixedBufferStream` with a writer.
+- **`defer allocator.free(optional)` fails** when the optional is `null`
+  because `@TypeOf(null)` is not a slice. Always unwrap first:
+  `defer if (opt) |v| allocator.free(v);`.
+- **Unused values are compile errors.** If you have a local constant you
+  deliberately don't use, discard it with `_ = name;`.

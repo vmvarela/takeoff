@@ -67,6 +67,8 @@ pub const ReleaseOptions = struct {
     clean_assets: bool = false,
     /// Also publish/update AUR package metadata after GitHub release.
     aur: bool = false,
+    /// Also generate/push Homebrew formula to tap repo after GitHub release.
+    homebrew: bool = false,
     /// Path to dist directory (default: "dist")
     dist_dir: []const u8 = "dist",
     /// Path to CHANGELOG.md (default: "CHANGELOG.md")
@@ -279,6 +281,8 @@ pub const Command = union(enum) {
                     options.clean_assets = true;
                 } else if (std.mem.eql(u8, opt, "--aur")) {
                     options.aur = true;
+                } else if (std.mem.eql(u8, opt, "--homebrew")) {
+                    options.homebrew = true;
                 } else if (std.mem.eql(u8, opt, "--dist") or std.mem.eql(u8, opt, "-D")) {
                     i += 1;
                     if (i >= args.len) {
@@ -1149,6 +1153,43 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 stdout.print("  {s}\n", .{aur_result.message}) catch {};
             }
         }
+
+        if (opts.homebrew) {
+            const hb_cfg = if (cfg.packages) |p| p.homebrew else null;
+            if (hb_cfg == null) {
+                stdout.print("\nHomebrew: skipped (packages.homebrew not configured)\n", .{}) catch {};
+            } else {
+                const project_desc = cfg.project.description orelse cfg.project.name;
+                const project_license = cfg.project.license orelse "unknown";
+                const gh_cfg = cfg.release.?.github.?;
+                const hb_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
+                defer if (hb_url.ptr != "".ptr) allocator.free(hb_url);
+
+                const hb_opts = TakeOff.publishers.HomebrewPublishOptions{
+                    .tap = hb_cfg.?.getTap(),
+                    .tap_ssh_key = hb_cfg.?.tap_ssh_key,
+                    .owner = gh_cfg.owner,
+                    .repo = gh_cfg.repo,
+                    .tag = tag,
+                    .project_name = cfg.project.name,
+                    .description = hb_cfg.?.description orelse project_desc,
+                    .homepage = hb_cfg.?.homepage orelse hb_url,
+                    .license = project_license,
+                    .dist_dir = opts.dist_dir,
+                    .dry_run = true,
+                };
+
+                var hb_result = TakeOff.publishers.publishHomebrewFormula(allocator, io, hb_opts) catch |err| {
+                    stdout.print("\nHomebrew dry-run failed: {s}\n", .{@errorName(err)}) catch {};
+                    return 0;
+                };
+                defer hb_result.deinit(allocator);
+
+                stdout.print("\nHomebrew formula (dry-run):\n", .{}) catch {};
+                stdout.print("  Formula: {s}\n", .{hb_result.formula_path}) catch {};
+                stdout.print("  {s}\n", .{hb_result.message}) catch {};
+            }
+        }
         return 0;
     }
 
@@ -1222,6 +1263,43 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             stdout.print("   Pushed: {}\n", .{aur_result.pushed}) catch {};
             stdout.print("   {s}\n", .{aur_result.message}) catch {};
         }
+
+        if (opts.homebrew) {
+            const hb_cfg = if (cfg.packages) |p| p.homebrew else null;
+            if (hb_cfg == null) {
+                stderr.print("Warning: --homebrew requested but packages.homebrew is not configured. Skipping Homebrew publish.\n", .{}) catch {};
+            } else {
+                const project_desc = cfg.project.description orelse cfg.project.name;
+                const project_license = cfg.project.license orelse "unknown";
+                const gh_cfg = cfg.release.?.github.?;
+
+                const hb_opts = TakeOff.publishers.HomebrewPublishOptions{
+                    .tap = hb_cfg.?.getTap(),
+                    .tap_ssh_key = hb_cfg.?.tap_ssh_key,
+                    .owner = gh_cfg.owner,
+                    .repo = gh_cfg.repo,
+                    .tag = tag,
+                    .project_name = cfg.project.name,
+                    .description = hb_cfg.?.description orelse project_desc,
+                    .homepage = hb_cfg.?.homepage orelse std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "",
+                    .license = project_license,
+                    .dist_dir = opts.dist_dir,
+                    .dry_run = false,
+                };
+                defer if (hb_opts.homepage.ptr != "".ptr) allocator.free(hb_opts.homepage);
+
+                var hb_result = TakeOff.publishers.publishHomebrewFormula(allocator, io, hb_opts) catch |err| {
+                    stderr.print("Warning: Homebrew publish failed: {s}\n", .{@errorName(err)}) catch {};
+                    return 0;
+                };
+                defer hb_result.deinit(allocator);
+
+                stdout.print("\n🍺 Homebrew formula\n", .{}) catch {};
+                stdout.print("   Formula: {s}\n", .{hb_result.formula_path}) catch {};
+                stdout.print("   Pushed: {}\n", .{hb_result.pushed}) catch {};
+                stdout.print("   {s}\n", .{hb_result.message}) catch {};
+            }
+        }
         return 0;
     } else {
         stdout.print("\n⚠️  Release completed with errors:\n", .{}) catch {};
@@ -1284,6 +1362,7 @@ const usage =
     \\      --dry-run    Show what would be done without publishing
     \\      --clean-assets Delete existing assets before uploading
     \\      --aur        Generate PKGBUILD/.SRCINFO and optionally push to AUR
+    \\      --homebrew   Generate Homebrew formula and push to tap repo
     \\  -D, --dist DIR   Path to dist directory (default: "dist")
     \\  -c, --changelog  Path to CHANGELOG.md (default: "CHANGELOG.md")
     \\
@@ -1543,6 +1622,18 @@ test "Command.fromArgs parses release with --aur" {
     switch (cmd) {
         .release => |opts| {
             try std.testing.expect(opts.aur);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses release with --homebrew" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--homebrew" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.homebrew);
         },
         else => return error.UnexpectedCommand,
     }
