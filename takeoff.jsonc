@@ -54,6 +54,17 @@
         "scoop": {
             "bucket": "vmvarela/scoop-bucket"
             // Optional: "bucket_ssh_key": "/home/you/.ssh/scoop-bucket"
+        },
+        // Winget manifest — submits to microsoft/winget-pkgs via fork PR
+        "winget": {
+            "publisher": "vmvarela",
+            "publisher_display_name": "Victor M. Varela",
+            "publisher_url": "https://github.com/vmvarela",
+            "short_description": "Release automation for Zig projects",
+            "homepage": "https://github.com/vmvarela/takeoff",
+            "license": "MIT",
+            "license_url": "https://github.com/vmvarela/takeoff/blob/master/LICENSE",
+            "fork_repo": "vmvarela/winget-pkgs"
         }
     },
 

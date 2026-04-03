@@ -230,7 +230,11 @@ pub fn publishWingetManifest(
 // ---------------------------------------------------------------------------
 
 /// Auto-detect the user's fork of microsoft/winget-pkgs via the GitHub API.
-/// Paginates through all repos if needed.
+///
+/// Strategy: fetch GET /user (to get the authenticated username), then probe
+/// GET /repos/{login}/winget-pkgs directly and verify fork=true and
+/// parent.full_name == "{upstream_owner}/{upstream_repo}".
+/// This avoids paginating /user/repos (which omits the parent field).
 fn detectFork(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -250,81 +254,60 @@ fn detectFork(
     ) catch return error.ForkNotFound;
     defer client.deinit();
 
-    var url: ?[]const u8 = try allocator.dupe(u8, "/user/repos?per_page=100&type=owner");
-    defer if (url) |u| allocator.free(u);
+    // Step 1: get the authenticated user's login
+    const user_response = client.makeRequest(.GET, "/user", null) catch return error.ForkNotFound;
+    defer client.allocator.free(user_response);
 
-    while (url) |current_url| {
-        allocator.free(current_url);
-        url = null;
+    const user_parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena_alloc,
+        user_response,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.ForkNotFound;
 
-        const response = client.makeRequest(.GET, current_url, null) catch |err| switch (err) {
-            error.NotFound => return error.ForkNotFound,
-            error.AuthenticationFailed => return error.ForkNotFound,
-            else => return error.ForkNotFound,
-        };
-        defer client.allocator.free(response);
+    const login = if (user_parsed.value == .object)
+        if (user_parsed.value.object.get("login")) |v|
+            if (v == .string) v.string else return error.ForkNotFound
+        else
+            return error.ForkNotFound
+    else
+        return error.ForkNotFound;
 
-        const parsed = std.json.parseFromSlice(
-            std.json.Value,
-            arena_alloc,
-            response,
-            .{ .ignore_unknown_fields = true },
-        ) catch return error.ForkNotFound;
+    // Step 2: probe /repos/{login}/{upstream_repo} and verify it is a fork of upstream
+    const repo_path = try std.fmt.allocPrint(arena_alloc, "/repos/{s}/{s}", .{ login, upstream_repo });
 
-        if (parsed.value != .array) return error.ForkNotFound;
+    const repo_response = client.makeRequest(.GET, repo_path, null) catch return error.ForkNotFound;
+    defer client.allocator.free(repo_response);
 
-        for (parsed.value.array.items) |item| {
-            if (item != .object) continue;
-            const obj = item.object;
+    const repo_parsed = std.json.parseFromSlice(
+        std.json.Value,
+        arena_alloc,
+        repo_response,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.ForkNotFound;
 
-            // Check if this is a fork
-            const is_fork = if (obj.get("fork")) |v|
-                if (v == .bool) v.bool else false
-            else
-                false;
-            if (!is_fork) continue;
+    if (repo_parsed.value != .object) return error.ForkNotFound;
+    const obj = repo_parsed.value.object;
 
-            // Check parent.full_name matches upstream
-            const parent = obj.get("parent") orelse continue;
-            if (parent != .object) continue;
-            const parent_obj = parent.object;
-            const parent_full_name = if (parent_obj.get("full_name")) |v|
-                if (v == .string) v.string else ""
-            else
-                "";
+    // Must be a fork
+    const is_fork = if (obj.get("fork")) |v| if (v == .bool) v.bool else false else false;
+    if (!is_fork) return error.ForkNotFound;
 
-            const expected = try std.fmt.allocPrint(
-                arena_alloc,
-                "{s}/{s}",
-                .{ upstream_owner, upstream_repo },
-            );
-            if (std.mem.eql(u8, parent_full_name, expected)) {
-                const full_name = if (obj.get("full_name")) |v|
-                    if (v == .string) v.string else ""
-                else
-                    "";
-                if (full_name.len > 0) {
-                    return try allocator.dupe(u8, full_name);
-                }
-            }
-        }
+    // Parent must match upstream
+    const parent = obj.get("parent") orelse return error.ForkNotFound;
+    if (parent != .object) return error.ForkNotFound;
+    const parent_full_name = if (parent.object.get("full_name")) |v|
+        if (v == .string) v.string else ""
+    else
+        "";
 
-        // Check for next page via Link header
-        const link_header = client.last_link_header orelse break;
-        const next_url = client.parseLinkHeader(link_header) orelse break;
-        defer client.allocator.free(next_url);
+    const expected = try std.fmt.allocPrint(arena_alloc, "{s}/{s}", .{ upstream_owner, upstream_repo });
+    if (!std.mem.eql(u8, parent_full_name, expected)) return error.ForkNotFound;
 
-        // Convert full URL to path for makeRequest
-        const uri = std.Uri.parse(next_url) catch break;
-        const path_str = switch (uri.path) {
-            .raw => |r| allocator.dupe(u8, r) catch break,
-            .percent_encoded => |p| allocator.dupe(u8, p) catch break,
-        };
-        errdefer allocator.free(path_str);
-        url = path_str;
-    }
-
-    return error.ForkNotFound;
+    // Return "{login}/{upstream_repo}"
+    const full_name = if (obj.get("full_name")) |v| if (v == .string) v.string else "" else "";
+    if (full_name.len == 0) return error.ForkNotFound;
+    return try allocator.dupe(u8, full_name);
 }
 
 // ---------------------------------------------------------------------------
@@ -386,9 +369,9 @@ fn pushAndCreatePr(
     defer allocator.free(clone_url);
 
     const clone_cmd = if (ssh_cmd) |s|
-        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git clone \"{s}\" \"{s}\"", .{ s, clone_url, tmp_dir })
+        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git clone --depth=1 \"{s}\" \"{s}\"", .{ s, clone_url, tmp_dir })
     else
-        try std.fmt.allocPrint(allocator, "git clone \"{s}\" \"{s}\"", .{ clone_url, tmp_dir });
+        try std.fmt.allocPrint(allocator, "git clone --depth=1 \"{s}\" \"{s}\"", .{ clone_url, tmp_dir });
     defer allocator.free(clone_cmd);
     try runShell(allocator, io, clone_cmd);
 
