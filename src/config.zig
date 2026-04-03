@@ -156,6 +156,26 @@ pub const ScoopPackage = struct {
     }
 };
 
+/// Configuration for generating a Winget manifest (Windows Package Manager).
+pub const WingetPackage = struct {
+    /// Publisher name for PackageIdentifier (e.g. "vmvarela").
+    /// Falls back to the GitHub owner if not specified.
+    publisher: ?[]const u8 = null,
+    /// Override description (falls back to project.description).
+    description: ?[]const u8 = null,
+    /// Override homepage (falls back to GitHub repo URL).
+    homepage: ?[]const u8 = null,
+    /// GitHub fork repo for pushing (e.g. "vmvarela/winget-pkgs").
+    /// If null, the publisher auto-detects the user's fork via the GitHub API.
+    fork_repo: ?[]const u8 = null,
+    /// SSH key for pushing to the fork (falls back to WINGET_FORK_SSH_KEY env).
+    fork_ssh_key: ?[]const u8 = null,
+
+    pub fn getPublisher(self: @This()) []const u8 {
+        return self.publisher orelse "";
+    }
+};
+
 pub const Packages = struct {
     tarball: ?TarballPackage = null,
     deb: ?DebPackage = null,
@@ -163,6 +183,7 @@ pub const Packages = struct {
     apk: ?ApkPackage = null,
     homebrew: ?HomebrewPackage = null,
     scoop: ?ScoopPackage = null,
+    winget: ?WingetPackage = null,
 };
 
 pub const GitHubRelease = struct {
@@ -302,6 +323,13 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .homepage = try dupeOptStr(allocator, sc.homepage),
             .bucket_ssh_key = try dupeOptStr(allocator, sc.bucket_ssh_key),
         } else null;
+        const winget: ?WingetPackage = if (pkg.winget) |wg| WingetPackage{
+            .publisher = try dupeOptStr(allocator, wg.publisher),
+            .description = try dupeOptStr(allocator, wg.description),
+            .homepage = try dupeOptStr(allocator, wg.homepage),
+            .fork_repo = try dupeOptStr(allocator, wg.fork_repo),
+            .fork_ssh_key = try dupeOptStr(allocator, wg.fork_ssh_key),
+        } else null;
         break :blk Packages{
             .tarball = tarball,
             .deb = deb,
@@ -309,6 +337,7 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .apk = apk,
             .homebrew = homebrew,
             .scoop = scoop,
+            .winget = winget,
         };
     } else null;
 
@@ -1057,4 +1086,50 @@ test "find discovers takeoff.jsonc in current directory" {
     defer allocator.free(path);
 
     try std.testing.expect(std.mem.eql(u8, path, "takeoff.jsonc"));
+}
+
+test "WingetPackage getPublisher returns default when nil" {
+    const w = WingetPackage{};
+    try std.testing.expectEqualStrings("", w.getPublisher());
+}
+
+test "load parses packages.winget config" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {"name": "mypkg"},
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}],
+        \\  "packages": {
+        \\    "winget": {
+        \\      "publisher": "MyCompany",
+        \\      "description": "My awesome package",
+        \\      "homepage": "https://example.com",
+        \\      "fork_repo": "myuser/winget-pkgs"
+        \\    }
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+
+    try std.testing.expect(cfg.packages != null);
+    try std.testing.expect(cfg.packages.?.winget != null);
+    const w = cfg.packages.?.winget.?;
+    try std.testing.expectEqualStrings("MyCompany", w.publisher.?);
+    try std.testing.expectEqualStrings("My awesome package", w.description.?);
+    try std.testing.expectEqualStrings("https://example.com", w.homepage.?);
+    try std.testing.expectEqualStrings("myuser/winget-pkgs", w.fork_repo.?);
 }

@@ -26,6 +26,8 @@ pub const PackageResult = struct {
     apk_path: ?[]const u8,
     /// Path to the generated Scoop manifest JSON, if produced (set once, not per-target).
     scoop_path: ?[]const u8,
+    /// Path to the generated Winget manifest directory, if produced (set once, not per-target).
+    winget_path: ?[]const u8,
     error_message: ?[]const u8,
 
     pub fn deinit(self: *PackageResult, allocator: std.mem.Allocator) void {
@@ -35,6 +37,7 @@ pub const PackageResult = struct {
         if (self.rpm_path) |p| allocator.free(p);
         if (self.apk_path) |p| allocator.free(p);
         if (self.scoop_path) |p| allocator.free(p);
+        if (self.winget_path) |p| allocator.free(p);
         if (self.error_message) |m| allocator.free(m);
     }
 };
@@ -72,6 +75,9 @@ pub const PackageSummary = struct {
                     try writer.print("   → {s}\n", .{path});
                 }
                 if (result.scoop_path) |path| {
+                    try writer.print("   → {s}\n", .{path});
+                }
+                if (result.winget_path) |path| {
                     try writer.print("   → {s}\n", .{path});
                 }
             } else {
@@ -163,6 +169,7 @@ fn packageTarget(
             .rpm_path = null,
             .apk_path = null,
             .scoop_path = null,
+            .winget_path = null,
             .error_message = error_msg,
         };
     };
@@ -210,6 +217,7 @@ fn packageTarget(
             .rpm_path = null,
             .apk_path = null,
             .scoop_path = null,
+            .winget_path = null,
             .error_message = error_copy,
         };
     }
@@ -272,6 +280,7 @@ fn packageTarget(
         .rpm_path = rpm_path_copy,
         .apk_path = apk_path_copy,
         .scoop_path = null,
+        .winget_path = null,
         .error_message = null,
     };
 }
@@ -516,6 +525,107 @@ pub fn generateScoopManifest(
     return try allocator.dupe(u8, output_path);
 }
 
+/// Generate Winget manifest YAML files.
+///
+/// This is called once after all targets are packaged, using the Windows zip
+/// archives to compute SHA-256 hashes. Returns the output directory path on
+/// success, or null if generation failed or winget is not configured.
+pub fn generateWingetManifest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    version: []const u8,
+    output_dir: []const u8,
+    results: []const PackageResult,
+) !?[]const u8 {
+    const winget_cfg = if (cfg.packages) |p| p.winget else null;
+    if (winget_cfg == null) return null;
+
+    // Find the Windows zip archives in the results
+    var url_x64: ?[]const u8 = null;
+    var sha256_x64: ?[]const u8 = null;
+    var url_arm64: ?[]const u8 = null;
+    var sha256_arm64: ?[]const u8 = null;
+
+    for (results) |result| {
+        if (!result.success) continue;
+        const archive_path = result.archive_path orelse continue;
+
+        // Determine architecture from the target string
+        const is_windows_x86_64 = std.mem.indexOf(u8, result.target, "windows-x86_64") != null;
+        const is_windows_arm64 = std.mem.indexOf(u8, result.target, "windows-aarch64") != null;
+
+        if (is_windows_x86_64) {
+            url_x64 = try buildDownloadUrl(allocator, cfg, version, archive_path);
+            sha256_x64 = try computeFileSha256(allocator, archive_path);
+        } else if (is_windows_arm64) {
+            url_arm64 = try buildDownloadUrl(allocator, cfg, version, archive_path);
+            sha256_arm64 = try computeFileSha256(allocator, archive_path);
+        }
+    }
+
+    // Need at least the x64 archive
+    if (url_x64 == null or sha256_x64 == null) return null;
+    defer {
+        if (url_x64) |u| allocator.free(u);
+        if (sha256_x64) |h| allocator.free(h);
+    }
+
+    // Determine publisher — fallback to GitHub owner
+    const publisher = if (winget_cfg.?.publisher) |p| p else blk: {
+        if (cfg.release) |rel| {
+            if (rel.github) |gh| break :blk gh.owner;
+        }
+        return null;
+    };
+
+    // Determine binary name
+    const binary_name = try std.fmt.allocPrint(allocator, "{s}.exe", .{cfg.project.name});
+    defer allocator.free(binary_name);
+
+    // Determine homepage
+    const homepage = if (winget_cfg.?.homepage) |h| h else if (cfg.release) |rel|
+        if (rel.github) |gh|
+            try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh.owner, gh.repo })
+        else
+            null
+    else
+        null;
+    defer if (homepage) |h| allocator.free(h);
+
+    // Determine description and license
+    const description = winget_cfg.?.description orelse cfg.project.description orelse cfg.project.name;
+    const license = cfg.project.license orelse "Unknown";
+
+    // Build output directory: {output_dir}/winget/
+    const winget_dir = try std.fs.path.join(allocator, &.{ output_dir, "winget" });
+    defer allocator.free(winget_dir);
+
+    const winget_gen_cfg = packagers.winget.WingetConfig{
+        .publisher = publisher,
+        .project_name = cfg.project.name,
+        .version = version,
+        .description = description,
+        .homepage = homepage orelse "",
+        .license = license,
+        .url_x64 = url_x64.?,
+        .sha256_x64 = try allocator.dupe(u8, sha256_x64.?),
+        .url_arm64 = url_arm64,
+        .sha256_arm64 = sha256_arm64,
+        .binary_name = binary_name,
+        .output_dir = winget_dir,
+    };
+    defer if (winget_gen_cfg.sha256_x64.ptr != sha256_x64.?.ptr) allocator.free(winget_gen_cfg.sha256_x64);
+
+    packagers.winget.generate(allocator, io, winget_gen_cfg) catch |err| {
+        log.err("failed to generate Winget manifest: {}", .{err});
+        return null;
+    };
+
+    log.info("generated Winget manifest: {s}", .{winget_dir});
+    return try allocator.dupe(u8, winget_dir);
+}
+
 /// Build a GitHub release download URL from an archive path.
 fn buildDownloadUrl(
     allocator: std.mem.Allocator,
@@ -621,6 +731,7 @@ pub fn generatePackages(
                 .rpm_path = null,
                 .apk_path = null,
                 .scoop_path = null,
+                .winget_path = null,
                 .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
             };
         }
@@ -678,6 +789,30 @@ pub fn generatePackages(
         for (results) |*r| {
             if (r.success) {
                 r.scoop_path = sp;
+                break;
+            }
+        }
+    }
+
+    // Generate Winget manifest (once, after all targets are packaged).
+    // This needs the Windows zip archives to exist so it can compute SHA-256.
+    const winget_path = generateWingetManifest(
+        allocator,
+        io,
+        cfg,
+        version,
+        output_dir,
+        results,
+    ) catch |err| blk: {
+        log.err("failed to generate Winget manifest: {}", .{err});
+        break :blk null;
+    };
+
+    // Attach winget_path to the first successful result for tracking.
+    if (winget_path) |wp| {
+        for (results) |*r| {
+            if (r.success) {
+                r.winget_path = wp;
                 break;
             }
         }
@@ -806,6 +941,7 @@ fn packageWorker(
             .rpm_path = null,
             .apk_path = null,
             .scoop_path = null,
+            .winget_path = null,
             .error_message = if (error_msg_temp) |msg| allocator.dupe(u8, msg) catch null else null,
         };
         return;
@@ -818,6 +954,7 @@ fn packageWorker(
         if (result.rpm_path) |path| temp_allocator.free(path);
         if (result.apk_path) |path| temp_allocator.free(path);
         if (result.scoop_path) |path| temp_allocator.free(path);
+        if (result.winget_path) |path| temp_allocator.free(path);
         if (result.error_message) |msg| temp_allocator.free(msg);
     }
 
@@ -827,6 +964,7 @@ fn packageWorker(
     const copied_rpm = if (result.rpm_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_apk = if (result.apk_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_scoop = if (result.scoop_path) |path| allocator.dupe(u8, path) catch null else null;
+    const copied_winget = if (result.winget_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_error = if (result.error_message) |msg| allocator.dupe(u8, msg) catch null else null;
 
     context.allocator_mutex.lockUncancelable(context.io);
@@ -840,6 +978,7 @@ fn packageWorker(
         .rpm_path = copied_rpm,
         .apk_path = copied_apk,
         .scoop_path = copied_scoop,
+        .winget_path = copied_winget,
         .error_message = copied_error,
     };
 
@@ -915,6 +1054,7 @@ test "PackageSummary calculates correctly" {
         .rpm_path = null,
         .apk_path = null,
         .scoop_path = null,
+        .winget_path = null,
         .error_message = null,
     };
 
@@ -926,6 +1066,7 @@ test "PackageSummary calculates correctly" {
         .rpm_path = null,
         .apk_path = null,
         .scoop_path = null,
+        .winget_path = null,
         .error_message = try allocator.dupe(u8, "Build failed"),
     };
 
@@ -937,6 +1078,7 @@ test "PackageSummary calculates correctly" {
         .rpm_path = null,
         .apk_path = null,
         .scoop_path = null,
+        .winget_path = null,
         .error_message = null,
     };
 
@@ -1008,6 +1150,7 @@ test "packageWorkerLoop claims all indices with bounded workers" {
             .rpm_path = null,
             .apk_path = null,
             .scoop_path = null,
+            .winget_path = null,
             .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
         };
     }

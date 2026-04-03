@@ -24,8 +24,13 @@ pub const ScoopPublishOptions = scoop.ScoopPublishOptions;
 pub const ScoopPublishResult = scoop.ScoopPublishResult;
 pub const ScoopPublishError = scoop.ScoopPublishError;
 pub const publishScoopManifest = scoop.publishScoopManifest;
+pub const WingetPublishOptions = winget.WingetPublishOptions;
+pub const WingetPublishResult = winget.WingetPublishResult;
+pub const WingetPublishError = winget.WingetPublishError;
+pub const publishWingetManifest = winget.publishWingetManifest;
 
 const scoop = @import("scoop.zig");
+const winget = @import("winget.zig");
 
 pub const GitHubErrorCode = enum {
     none,
@@ -67,4 +72,8 @@ test "module exports" {
     _ = ScoopPublishResult;
     _ = ScoopPublishError;
     _ = publishScoopManifest;
+    _ = WingetPublishOptions;
+    _ = WingetPublishResult;
+    _ = WingetPublishError;
+    _ = publishWingetManifest;
 }
