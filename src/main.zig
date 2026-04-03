@@ -74,6 +74,8 @@ pub const ReleaseOptions = struct {
     homebrew: bool = false,
     /// Also generate/push Scoop manifest to bucket repo after GitHub release.
     scoop: bool = false,
+    /// Also generate/push Winget manifest and open PR to winget-pkgs after GitHub release.
+    winget: bool = false,
     /// Path to dist directory (default: "dist")
     dist_dir: []const u8 = "dist",
     /// Path to CHANGELOG.md (default: "CHANGELOG.md")
@@ -292,6 +294,8 @@ pub const Command = union(enum) {
                     options.homebrew = true;
                 } else if (std.mem.eql(u8, opt, "--scoop")) {
                     options.scoop = true;
+                } else if (std.mem.eql(u8, opt, "--winget")) {
+                    options.winget = true;
                 } else if (std.mem.eql(u8, opt, "--dist") or std.mem.eql(u8, opt, "-D")) {
                     i += 1;
                     if (i >= args.len) {
@@ -1244,6 +1248,49 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 stdout.print("  {s}\n", .{sc_result.message}) catch {};
             }
         }
+
+        if (opts.winget) {
+            const wg_cfg = if (cfg.packages) |p| p.winget else null;
+            if (wg_cfg == null) {
+                stdout.print("\nWinget: skipped (packages.winget not configured)\n", .{}) catch {};
+            } else {
+                const project_desc = cfg.project.description orelse cfg.project.name;
+                const project_license = cfg.project.license orelse "unknown";
+                const gh_cfg = cfg.release.?.github.?;
+                const wg_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
+                defer if (wg_url.ptr != "".ptr) allocator.free(wg_url);
+
+                const environ = std.Options.debug_threaded_io.?.environ.process_environ;
+                const github_token = std.process.Environ.getAlloc(environ, allocator, "GITHUB_TOKEN") catch "";
+                defer allocator.free(github_token);
+
+                const wg_opts = TakeOff.publishers.WingetPublishOptions{
+                    .publisher = wg_cfg.?.getPublisher(),
+                    .owner = gh_cfg.owner,
+                    .repo = gh_cfg.repo,
+                    .tag = tag,
+                    .project_name = cfg.project.name,
+                    .description = wg_cfg.?.description orelse project_desc,
+                    .homepage = wg_cfg.?.homepage orelse wg_url,
+                    .license = project_license,
+                    .dist_dir = opts.dist_dir,
+                    .fork_repo = wg_cfg.?.fork_repo,
+                    .fork_ssh_key = wg_cfg.?.fork_ssh_key,
+                    .github_token = github_token,
+                    .dry_run = true,
+                };
+
+                var wg_result = TakeOff.publishers.publishWingetManifest(allocator, io, wg_opts) catch |err| {
+                    stdout.print("\nWinget dry-run failed: {s}\n", .{@errorName(err)}) catch {};
+                    return 0;
+                };
+                defer wg_result.deinit(allocator);
+
+                stdout.print("\nWinget manifest (dry-run):\n", .{}) catch {};
+                stdout.print("  Manifest dir: {s}\n", .{wg_result.manifest_dir}) catch {};
+                stdout.print("  {s}\n", .{wg_result.message}) catch {};
+            }
+        }
         return 0;
     }
 
@@ -1393,6 +1440,54 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 stdout.print("   {s}\n", .{sc_result.message}) catch {};
             }
         }
+
+        if (opts.winget) {
+            const wg_cfg = if (cfg.packages) |p| p.winget else null;
+            if (wg_cfg == null) {
+                stderr.print("Warning: --winget requested but packages.winget is not configured. Skipping Winget publish.\n", .{}) catch {};
+            } else {
+                const project_desc = cfg.project.description orelse cfg.project.name;
+                const project_license = cfg.project.license orelse "unknown";
+                const gh_cfg = cfg.release.?.github.?;
+
+                const wg_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
+                defer if (wg_url.ptr != "".ptr) allocator.free(wg_url);
+
+                const environ = std.Options.debug_threaded_io.?.environ.process_environ;
+                const github_token = std.process.Environ.getAlloc(environ, allocator, "GITHUB_TOKEN") catch "";
+                defer allocator.free(github_token);
+
+                const wg_opts = TakeOff.publishers.WingetPublishOptions{
+                    .publisher = wg_cfg.?.getPublisher(),
+                    .owner = gh_cfg.owner,
+                    .repo = gh_cfg.repo,
+                    .tag = tag,
+                    .project_name = cfg.project.name,
+                    .description = wg_cfg.?.description orelse project_desc,
+                    .homepage = wg_cfg.?.homepage orelse wg_url,
+                    .license = project_license,
+                    .dist_dir = opts.dist_dir,
+                    .fork_repo = wg_cfg.?.fork_repo,
+                    .fork_ssh_key = wg_cfg.?.fork_ssh_key,
+                    .github_token = github_token,
+                    .dry_run = false,
+                };
+
+                var wg_result = TakeOff.publishers.publishWingetManifest(allocator, io, wg_opts) catch |err| {
+                    stderr.print("Warning: Winget publish failed: {s}\n", .{@errorName(err)}) catch {};
+                    return 0;
+                };
+                defer wg_result.deinit(allocator);
+
+                stdout.print("\n🪟 Winget manifest\n", .{}) catch {};
+                stdout.print("   Manifest: {s}\n", .{wg_result.manifest_dir}) catch {};
+                stdout.print("   PR created: {}\n", .{wg_result.pr_created}) catch {};
+                if (wg_result.pr_url.len > 0) {
+                    stdout.print("   PR URL: {s}\n", .{wg_result.pr_url}) catch {};
+                }
+                stdout.print("   {s}\n", .{wg_result.message}) catch {};
+            }
+        }
         return 0;
     } else {
         stdout.print("\n⚠️  Release completed with errors:\n", .{}) catch {};
@@ -1459,6 +1554,7 @@ const usage =
     \\      --aur        Generate PKGBUILD/.SRCINFO and optionally push to AUR
     \\      --homebrew   Generate Homebrew formula and push to tap repo
     \\      --scoop      Generate Scoop manifest and push to bucket repo
+    \\      --winget     Generate Winget manifest and open PR to winget-pkgs
     \\  -D, --dist DIR   Path to dist directory (default: "dist")
     \\  -c, --changelog  Path to CHANGELOG.md (default: "CHANGELOG.md")
     \\

@@ -4,13 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.4.0] - 2026-04-03
+
 ### Added
 
 - `takeoff release --replace-assets` flag — for each artifact being uploaded, deletes only the same-named existing asset before uploading; mutually exclusive with `--clean-assets` (#35)
 - Native Scoop manifest generation — produces a valid `<name>.json` manifest with download URL, hash, and architecture metadata (#14)
 - Native Winget manifest generation — produces a valid YAML manifest set (`version`, `installer`, `defaultLocale`) ready for submission to `winget-pkgs` (#15)
-- Native Chocolatey packager — generates `.nuspec` and `.nupkg` from templates, ready for `choco push` (#16)
-- Native `.msi` packager via `wixl` — produces a signed Windows installer from a WiX source template (#17)
 - AUR publisher now generates `LICENSE` (0BSD) and `REUSE.toml` files per RFC 40 / RFC 52
 - Optional `maintainer` field in `release.aur` config for proper PKGBUILD header
 

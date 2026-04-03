@@ -121,6 +121,8 @@ pub const GitHubClient = struct {
     /// Per-request deadline (pinned at request start).  `.none` if disabled.
     request_timeout: std.Io.Timeout,
     max_response_size: usize,
+    /// Last Link header value from a response (for pagination).
+    last_link_header: ?[]const u8 = null,
 
     /// Initialize a new GitHub client with default options.
     /// Caller owns the returned memory and must call deinit.
@@ -171,6 +173,7 @@ pub const GitHubClient = struct {
         self.http_client.deinit();
         self.allocator.free(self.token);
         self.allocator.free(self.base_url);
+        if (self.last_link_header) |h| self.allocator.free(h);
     }
 
     /// Build extra headers for GitHub API requests.
@@ -204,9 +207,9 @@ pub const GitHubClient = struct {
     }
 
     /// Parse Link header for pagination.
-    fn parseLinkHeader(self: *GitHubClient, link_header: []const u8) ?[]const u8 {
+    pub fn parseLinkHeader(self: *GitHubClient, link_header: []const u8) ?[]const u8 {
         // Link: <url>; rel="next", <url>; rel="last"
-        var it = std.mem.split(u8, link_header, ",");
+        var it = std.mem.splitScalar(u8, link_header, ',');
         while (it.next()) |part| {
             const trimmed = std.mem.trim(u8, part, " ");
             if (std.mem.endsWith(u8, trimmed, "; rel=\"next\"")) {
@@ -221,8 +224,27 @@ pub const GitHubClient = struct {
         return null;
     }
 
+    /// Find the Link header value in raw HTTP head bytes.
+    fn findLinkHeader(allocator: std.mem.Allocator, head_bytes: []const u8) ?[]const u8 {
+        // head_bytes contains the full HTTP response head:
+        // "HTTP/1.1 200 OK\r\nHeader1: value1\r\nLink: <...>\r\n\r\n"
+        var lines = std.mem.splitSequence(u8, head_bytes, "\r\n");
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            // Skip the status line
+            if (std.mem.startsWith(u8, line, "HTTP/")) continue;
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+            const name = line[0..colon];
+            if (std.ascii.eqlIgnoreCase(name, "link")) {
+                const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+                return allocator.dupe(u8, value) catch null;
+            }
+        }
+        return null;
+    }
+
     /// Make a request to the GitHub API.
-    fn makeRequest(
+    pub fn makeRequest(
         self: *GitHubClient,
         method: std.http.Method,
         path: []const u8,
@@ -329,6 +351,10 @@ pub const GitHubClient = struct {
         };
 
         const status = response.head.status;
+
+        // Capture Link header for pagination (parse from raw head bytes)
+        if (self.last_link_header) |old| self.allocator.free(old);
+        self.last_link_header = findLinkHeader(self.allocator, response.head.bytes);
 
         // Read response body with size limit
         var response_body: std.ArrayListUnmanaged(u8) = .empty;
