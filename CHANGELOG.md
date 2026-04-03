@@ -11,6 +11,8 @@ All notable changes to this project will be documented in this file.
 - Native Winget manifest generation — produces a valid YAML manifest set (`version`, `installer`, `defaultLocale`) ready for submission to `winget-pkgs` (#15)
 - Native Chocolatey packager — generates `.nuspec` and `.nupkg` from templates, ready for `choco push` (#16)
 - Native `.msi` packager via `wixl` — produces a signed Windows installer from a WiX source template (#17)
+- AUR publisher now generates `LICENSE` (0BSD) and `REUSE.toml` files per RFC 40 / RFC 52
+- Optional `maintainer` field in `release.aur` config for proper PKGBUILD header
 
 ### Fixed
 
@@ -22,6 +24,11 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - SSH key for publishers can now be provided via a common `TAKEOFF_SSH_KEY` environment variable as a fallback when no publisher-specific key is configured (#36)
+- AUR package name defaults to project name instead of requiring `-bin` suffix
+- AUR publisher falls back to `~/.ssh/config` when no explicit SSH key is configured (same for Homebrew)
+- AUR PKGBUILD uses explicit directory path instead of fragile `find` command
+- AUR PKGBUILD removes redundant `provides`/`conflicts` for self (complies with Arch guidelines)
+- AUR PKGBUILD installs upstream LICENSE to `/usr/share/licenses/<pkgname>/`
 
 ## [v0.3.0] - 2026-04-02
 
