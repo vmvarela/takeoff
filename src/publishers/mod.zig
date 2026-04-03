@@ -20,6 +20,12 @@ pub const HomebrewPublishOptions = homebrew.HomebrewPublishOptions;
 pub const HomebrewPublishResult = homebrew.HomebrewPublishResult;
 pub const HomebrewPublishError = homebrew.HomebrewPublishError;
 pub const publishHomebrewFormula = homebrew.publishHomebrewFormula;
+pub const ScoopPublishOptions = scoop.ScoopPublishOptions;
+pub const ScoopPublishResult = scoop.ScoopPublishResult;
+pub const ScoopPublishError = scoop.ScoopPublishError;
+pub const publishScoopManifest = scoop.publishScoopManifest;
+
+const scoop = @import("scoop.zig");
 
 pub const GitHubErrorCode = enum {
     none,
@@ -57,4 +63,8 @@ test "module exports" {
     _ = HomebrewPublishResult;
     _ = HomebrewPublishError;
     _ = publishHomebrewFormula;
+    _ = ScoopPublishOptions;
+    _ = ScoopPublishResult;
+    _ = ScoopPublishError;
+    _ = publishScoopManifest;
 }

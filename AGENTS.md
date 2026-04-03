@@ -54,8 +54,28 @@ versions. Use the patterns below — do not use the old equivalents.
 | Trim leading whitespace | `std.mem.trim(u8, s, " \t")` | `std.mem.trimLeft` (removed) |
 | Trim trailing whitespace | `std.mem.trim(u8, s, " \t")` | `std.mem.trimRight` (removed) |
 | Format into ArrayList | Use `appendSlice` + `std.fmt.allocPrint` | `std.fmt.format(list.writer(allocator), ...)` |
-| Free optional string | `if (opt) |v| allocator.free(v);` | `allocator.free(opt)` (type error) |
+| Free optional string | `if (opt) \|v\| allocator.free(v);` | `allocator.free(opt)` (type error) |
 | Discard a value | `_ = value;` | `value;` (compile error) |
+| Current working directory | `std.Io.Dir.cwd()` | `std.fs.cwd()` |
+| Open a file for reading | `std.Io.Dir.cwd().openFile(io, path, .{})` | `std.fs.cwd().openFile(path, .{})` |
+| Read entire file | `std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max))` | `std.fs.cwd().readFileAlloc(allocator, path, max)` |
+| Create a file | `std.Io.Dir.cwd().createFile(io, path)` | `std.fs.cwd().createFile(path, .{})` |
+| Write to file | `file.writeStreamingAll(io, data)` | `file.writeAll(data)` (doesn't exist on `std.Io.File`) |
+| Close a file | `file.close(io)` | `file.close()` (no args) |
+| Create a file | `std.Io.Dir.cwd().createFile(io, path, .{...})` | `std.Io.Dir.cwd().createFile(io, path)` (3rd arg required) |
+| Iterate directory | `var iter = dir.iterate(); while (iter.next(io) catch null) |entry| { ... }` | `dir.iterate(io)` or `iter.next()` |
+| SHA-256 hasher | `std.crypto.hash.sha2.Sha256.init(.{})` | `std.crypto.hash.Sha2.init(.{})` |
+| SHA-256 digest length | `std.crypto.hash.sha2.Sha256.digest_length` | `std.crypto.hash.Sha2.digest_length` |
+| ArrayList writer | `list.writer(allocator)` returns `*std.Io.Writer` | `list.writer()` (no allocator) |
+| GPA allocator | `std.heap.page_allocator` (GPA removed) | `std.heap.GeneralPurposeAllocator(.{}){}` |
+| JSON stringify to string | `std.json.Stringify.valueAlloc(allocator, value, .{...})` | `std.json.stringifyAlloc(...)` (removed) |
+| JSON streaming writer | `var jw = std.json.Stringify{ .writer = w, .options = .{...} }; try jw.beginObject(); ...` | `std.json.writeStream(...)` (doesn't exist) |
+| JSON serialize with writer | `var jw = std.json.Stringify{ .writer = w, .options = .{...} }; try jw.beginObject(); ...` | `std.json.stringify(value, .{...}, writer)` |
+| Child process spawn | `var child = std.process.Child.init(argv, allocator); child.spawn(); ...; child.wait(io);` | `std.process.Child.init(...)` then `child.wait()` (io arg needed) |
+| Child process result | `std.process.Child.Term` | `std.process.Child.RunResult` (doesn't exist) |
+| Child process result | `std.process.Child.Term` | `std.process.Term` (doesn't exist at top level) |
+| Run process with cwd | Use `sh -c "git -C \"{dir}\" ..."` via `std.process.run` | `std.process.Child.init` + `child.cwd = ...` (Child.init doesn't exist in 0.16) |
+| `std.fs.path.dirname` | Returns `?[]const u8` (no error union) | `try std.fs.path.dirname(...)` |
 
 ### Common gotchas
 
@@ -77,6 +97,54 @@ versions. Use the patterns below — do not use the old equivalents.
   Use `log.warn` for user-facing argument errors (invalid flag, missing value,
   mutually exclusive flags, etc.). Reserve `log.err` for genuine internal
   failures (network errors, I/O failures, unexpected state).
+- **`std.fs` is mostly gone for file I/O.** Use `std.Io.Dir.cwd()` for the
+  current directory, then call `.openFile(io, path, .{})`, `.createFile(io, path)`,
+  `.createDirPath(io, path)`, `.readFileAlloc(io, path, allocator, .limited(max))`.
+  `std.fs.path` still works for path manipulation (dirname, basename, join).
+- **`std.json.stringifyAlloc` was removed.** Use `std.json.Stringify.valueAlloc(allocator, value, .{...})`
+  to get a JSON string, or construct a `std.json.Stringify` manually with
+  `.writer` and `.options` fields and call `.beginObject()`, `.objectField()`,
+  `.write()`, `.endObject()` etc.
+- **Optional struct fields serialize as `null` in JSON.** If you need to omit
+  a field entirely (e.g. Scoop manifest without arm64), use manual
+  `std.fmt.allocPrint` with conditional blocks or the `std.json.Stringify`
+  streaming API — don't rely on struct-based serialization.
+- **Memory leaks in conditional allocPrint blocks.** When using `if (opt) |x| blk: { ... break :blk try std.fmt.allocPrint(...) } else ""`,
+  the allocated string is returned but never freed. Use an `ArenaAllocator`
+  for intermediate allocations: `var arena = std.heap.ArenaAllocator.init(allocator); defer arena.deinit(); const a = arena.allocator();`
+- **`std.fs.cwd()` does not exist.** Use `std.Io.Dir.cwd()` instead.
+- **`std.crypto.hash.Sha2` does not exist.** Use `std.crypto.hash.sha2.Sha256`
+  (note the lowercase `sha2` namespace and explicit `Sha256`).
+- **`std.heap.GeneralPurposeAllocator` was removed.** Use `std.heap.page_allocator`
+  or `std.heap.ArenaAllocator` instead.
+- **`ArrayList` has no `writer()` method in 0.16.** Use `std.fmt.allocPrint` +
+  `appendSlice`, or `std.io.fixedBufferStream` with a writer.
+- **`file.readAll()` doesn't exist on `std.Io.File`.** Use `file.readAll(&buf)`
+  which is a method on the file handle.
+- **`file.writeAll()` doesn't exist on `std.Io.File`.** Use
+  `file.writeStreamingAll(io, data)` instead.
+- **`file.close()` takes an `io` argument in 0.16.** Use `file.close(io)`.
+- **`std.Io.Dir.cwd().createFile()` takes 3 args:** `io`, `path`, and `.options`
+  (e.g. `.createFile(io, path, .{})`). Missing the third arg is a compile error.
+- **`dir.iterate()` takes no args; `iter.next(io)` takes `io`.** Pattern:
+  `var iter = dir.iterate(); while (iter.next(io) catch null) |entry| { ... }`
+- **`std.fs.path.dirname` returns `?[]const u8`, not an error union.** Do NOT
+  use `try` — it's a plain optional.
+- **`std.process.Child.init` does not exist in 0.16.** To run a command with a
+  specific working directory, use `sh -c "git -C \"{dir}\" ..."` via
+  `std.process.run`. The old `Child.init` + `child.cwd = ...` pattern is gone.
+- **`std.process.Child.RunResult` and `std.process.Term` do not exist.** Use
+  `std.process.Child.Term` for the exit status union.
+- **`child.wait()` requires an `io` argument in 0.16.** Use `child.wait(io)`.
+- **`std.process.run` does not support setting cwd.** If you need to run a
+  command in a specific directory, use `sh -c "cd dir && ..."` or the
+  `git -C "dir" ...` pattern for git commands.
+- **`std.process.run` needs an allocator that supports `allocSentinel`.**
+  `std.heap.page_allocator` does NOT work — `spawnPosix` internally calls
+  `allocSentinel` which requires alignment support. Use an `ArenaAllocator`
+  or any allocator that supports aligned allocations. The main binary works
+  fine because `main()` uses an arena; standalone test binaries using
+  `page_allocator` will fail with `OutOfMemory` during process spawning.
 
 ## Release workflow (dogfooding)
 
@@ -85,14 +153,6 @@ When releasing a new version of takeoff itself:
 1. `takeoff bump --minor` — bumps version and updates CHANGELOG.md
 2. `git tag vX.Y.Z && git push origin vX.Y.Z` — create and push the tag
 3. `takeoff build` — rebuild artifacts so filenames include the new tag
-4. `HOMEBREW_TAP_SSH_KEY=~/.ssh/id_rsa_vmvarela takeoff release --tag vX.Y.Z --replace-assets --homebrew`
-   - Always pass `--tag` explicitly. Without it, `takeoff release` calls
-     `git describe --tags`, which returns `vX.Y.Z-N-gSHA` if there are commits
-     after the tag — creating a spurious release with the wrong name.
-   - `--replace-assets` handles re-releases cleanly without a full wipe.
-   - `HOMEBREW_TAP_SSH_KEY` must point to the key for the `vmvarela` GitHub
-     account (`~/.ssh/id_rsa_vmvarela`). The default `github.com` SSH host in
-     this machine maps to a different account (`id_rsa_prisa`).
 
 ### Known issue: Homebrew temp dir not cleaned on failure
 

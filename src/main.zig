@@ -72,6 +72,8 @@ pub const ReleaseOptions = struct {
     aur: bool = false,
     /// Also generate/push Homebrew formula to tap repo after GitHub release.
     homebrew: bool = false,
+    /// Also generate/push Scoop manifest to bucket repo after GitHub release.
+    scoop: bool = false,
     /// Path to dist directory (default: "dist")
     dist_dir: []const u8 = "dist",
     /// Path to CHANGELOG.md (default: "CHANGELOG.md")
@@ -288,6 +290,8 @@ pub const Command = union(enum) {
                     options.aur = true;
                 } else if (std.mem.eql(u8, opt, "--homebrew")) {
                     options.homebrew = true;
+                } else if (std.mem.eql(u8, opt, "--scoop")) {
+                    options.scoop = true;
                 } else if (std.mem.eql(u8, opt, "--dist") or std.mem.eql(u8, opt, "-D")) {
                     i += 1;
                     if (i >= args.len) {
@@ -1203,6 +1207,43 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 stdout.print("  {s}\n", .{hb_result.message}) catch {};
             }
         }
+
+        if (opts.scoop) {
+            const sc_cfg = if (cfg.packages) |p| p.scoop else null;
+            if (sc_cfg == null) {
+                stdout.print("\nScoop: skipped (packages.scoop not configured)\n", .{}) catch {};
+            } else {
+                const project_desc = cfg.project.description orelse cfg.project.name;
+                const project_license = cfg.project.license orelse "unknown";
+                const gh_cfg = cfg.release.?.github.?;
+                const sc_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
+                defer if (sc_url.ptr != "".ptr) allocator.free(sc_url);
+
+                const sc_opts = TakeOff.publishers.ScoopPublishOptions{
+                    .bucket = sc_cfg.?.getBucket(),
+                    .bucket_ssh_key = sc_cfg.?.bucket_ssh_key,
+                    .owner = gh_cfg.owner,
+                    .repo = gh_cfg.repo,
+                    .tag = tag,
+                    .project_name = cfg.project.name,
+                    .description = sc_cfg.?.description orelse project_desc,
+                    .homepage = sc_cfg.?.homepage orelse sc_url,
+                    .license = project_license,
+                    .dist_dir = opts.dist_dir,
+                    .dry_run = true,
+                };
+
+                var sc_result = TakeOff.publishers.publishScoopManifest(allocator, io, sc_opts) catch |err| {
+                    stdout.print("\nScoop dry-run failed: {s}\n", .{@errorName(err)}) catch {};
+                    return 0;
+                };
+                defer sc_result.deinit(allocator);
+
+                stdout.print("\nScoop manifest (dry-run):\n", .{}) catch {};
+                stdout.print("  Manifest: {s}\n", .{sc_result.manifest_path}) catch {};
+                stdout.print("  {s}\n", .{sc_result.message}) catch {};
+            }
+        }
         return 0;
     }
 
@@ -1315,6 +1356,43 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 stdout.print("   {s}\n", .{hb_result.message}) catch {};
             }
         }
+
+        if (opts.scoop) {
+            const sc_cfg = if (cfg.packages) |p| p.scoop else null;
+            if (sc_cfg == null) {
+                stderr.print("Warning: --scoop requested but packages.scoop is not configured. Skipping Scoop publish.\n", .{}) catch {};
+            } else {
+                const project_desc = cfg.project.description orelse cfg.project.name;
+                const project_license = cfg.project.license orelse "unknown";
+                const gh_cfg = cfg.release.?.github.?;
+
+                const sc_opts = TakeOff.publishers.ScoopPublishOptions{
+                    .bucket = sc_cfg.?.getBucket(),
+                    .bucket_ssh_key = sc_cfg.?.bucket_ssh_key,
+                    .owner = gh_cfg.owner,
+                    .repo = gh_cfg.repo,
+                    .tag = tag,
+                    .project_name = cfg.project.name,
+                    .description = sc_cfg.?.description orelse project_desc,
+                    .homepage = sc_cfg.?.homepage orelse std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "",
+                    .license = project_license,
+                    .dist_dir = opts.dist_dir,
+                    .dry_run = false,
+                };
+                defer if (sc_opts.homepage.ptr != "".ptr) allocator.free(sc_opts.homepage);
+
+                var sc_result = TakeOff.publishers.publishScoopManifest(allocator, io, sc_opts) catch |err| {
+                    stderr.print("Warning: Scoop publish failed: {s}\n", .{@errorName(err)}) catch {};
+                    return 0;
+                };
+                defer sc_result.deinit(allocator);
+
+                stdout.print("\n🥄 Scoop manifest\n", .{}) catch {};
+                stdout.print("   Manifest: {s}\n", .{sc_result.manifest_path}) catch {};
+                stdout.print("   Pushed: {}\n", .{sc_result.pushed}) catch {};
+                stdout.print("   {s}\n", .{sc_result.message}) catch {};
+            }
+        }
         return 0;
     } else {
         stdout.print("\n⚠️  Release completed with errors:\n", .{}) catch {};
@@ -1380,6 +1458,7 @@ const usage =
     \\                   existing asset (mutually exclusive with --clean-assets)
     \\      --aur        Generate PKGBUILD/.SRCINFO and optionally push to AUR
     \\      --homebrew   Generate Homebrew formula and push to tap repo
+    \\      --scoop      Generate Scoop manifest and push to bucket repo
     \\  -D, --dist DIR   Path to dist directory (default: "dist")
     \\  -c, --changelog  Path to CHANGELOG.md (default: "CHANGELOG.md")
     \\

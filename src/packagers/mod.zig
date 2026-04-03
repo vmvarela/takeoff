@@ -7,3 +7,4 @@ pub const deb = @import("deb.zig");
 pub const rpm = @import("rpm.zig");
 pub const apk = @import("apk.zig");
 pub const homebrew = @import("homebrew.zig");
+pub const scoop = @import("scoop.zig");
