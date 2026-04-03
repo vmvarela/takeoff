@@ -16,7 +16,8 @@
         { "os": "linux", "arch": "x86_64" },
         { "os": "macos", "arch": "aarch64" },
         { "os": "macos", "arch": "x86_64" },
-        { "os": "windows", "arch": "x86_64" }
+        { "os": "windows", "arch": "x86_64" },
+        { "os": "windows", "arch": "aarch64" }
     ],
 
     // Package formats for distribution

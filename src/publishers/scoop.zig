@@ -70,30 +70,48 @@ pub fn publishScoopManifest(
 
     const packagers = @import("../packagers/scoop.zig");
 
-    // Find the Windows zip artifact
-    const artifact = try findWindowsZip(allocator, io, opts.dist_dir, opts.project_name);
-    defer {
-        allocator.free(artifact.file_name);
-        allocator.free(artifact.full_path);
-    }
-
     // Normalise version (strip 'v' prefix)
     const version = if (opts.tag.len > 0 and opts.tag[0] == 'v')
         opts.tag[1..]
     else
         opts.tag;
 
-    // Compute SHA-256 of the zip
-    const sha256 = try computeSha256(allocator, artifact.full_path);
-    defer allocator.free(sha256);
+    // Find the x86_64 Windows zip (required)
+    const x64_artifact = try findWindowsZipByArch(allocator, opts.dist_dir, opts.project_name, "x86_64");
+    defer {
+        allocator.free(x64_artifact.file_name);
+        allocator.free(x64_artifact.full_path);
+    }
 
-    // Build download URL
-    const download_url = try std.fmt.allocPrint(
+    const sha256_x64 = try computeSha256(allocator, x64_artifact.full_path);
+    defer allocator.free(sha256_x64);
+
+    const url_x64 = try std.fmt.allocPrint(
         allocator,
         "https://github.com/{s}/{s}/releases/download/{s}/{s}",
-        .{ opts.owner, opts.repo, opts.tag, artifact.file_name },
+        .{ opts.owner, opts.repo, opts.tag, x64_artifact.file_name },
     );
-    defer allocator.free(download_url);
+    defer allocator.free(url_x64);
+
+    // Find the arm64 Windows zip (optional)
+    var url_arm64: ?[]const u8 = null;
+    var sha256_arm64: ?[]const u8 = null;
+    if (findWindowsZipByArch(allocator, opts.dist_dir, opts.project_name, "aarch64")) |arm_artifact| {
+        const sha = computeSha256(allocator, arm_artifact.full_path) catch null;
+        const url = std.fmt.allocPrint(
+            allocator,
+            "https://github.com/{s}/{s}/releases/download/{s}/{s}",
+            .{ opts.owner, opts.repo, opts.tag, arm_artifact.file_name },
+        ) catch null;
+        allocator.free(arm_artifact.file_name);
+        allocator.free(arm_artifact.full_path);
+        url_arm64 = url;
+        sha256_arm64 = sha;
+    } else |_| {
+        // arm64 is optional — no artifact is fine
+    }
+    defer if (url_arm64) |u| allocator.free(u);
+    defer if (sha256_arm64) |h| allocator.free(h);
 
     const manifest_name = try std.fmt.allocPrint(allocator, "{s}.json", .{opts.project_name});
     defer allocator.free(manifest_name);
@@ -110,8 +128,10 @@ pub fn publishScoopManifest(
         .description = opts.description,
         .homepage = opts.homepage,
         .license = opts.license,
-        .url_64bit = download_url,
-        .sha256_64bit = sha256,
+        .url_64bit = url_x64,
+        .sha256_64bit = sha256_x64,
+        .url_arm64 = url_arm64,
+        .sha256_arm64 = sha256_arm64,
         .binary_name = binary_name,
         .output_path = manifest_path,
     };
@@ -187,17 +207,20 @@ pub fn publishScoopManifest(
     }
 }
 
-/// Find a Windows zip artifact in the dist directory.
-pub fn findWindowsZip(
+/// Find a Windows zip artifact for a specific architecture in the dist directory.
+///
+/// `arch` must be an architecture keyword present in the filename
+/// (e.g. "x86_64", "aarch64").  Returns `error.ArtifactNotFound` when no
+/// matching file exists.
+pub fn findWindowsZipByArch(
     allocator: std.mem.Allocator,
-    io: std.Io,
     dist_dir: []const u8,
     project_name: []const u8,
+    arch: []const u8,
 ) ScoopPublishError!struct {
     file_name: []const u8,
     full_path: []const u8,
 } {
-    _ = io;
     const dir = std.Io.Dir.cwd().openDir(std.Options.debug_io, dist_dir, .{ .iterate = true }) catch |err| {
         log.err("cannot open dist directory {s}: {}", .{ dist_dir, err });
         return error.ArtifactNotFound;
@@ -205,65 +228,22 @@ pub fn findWindowsZip(
     defer dir.close(std.Options.debug_io);
 
     var iter = dir.iterate();
-
-    // Collect all matching Windows zips so we can prefer x86_64 over arm64
-    var matches: std.ArrayListUnmanaged([]const u8) = .empty;
-    defer {
-        for (matches.items) |m| allocator.free(m);
-        matches.deinit(allocator);
-    }
-
     while (iter.next(std.Options.debug_io) catch null) |entry| {
         const name = entry.name;
         if (std.mem.startsWith(u8, name, project_name) and
             std.mem.endsWith(u8, name, ".zip") and
-            std.mem.indexOf(u8, name, "windows") != null)
+            std.mem.indexOf(u8, name, "windows") != null and
+            std.mem.indexOf(u8, name, arch) != null)
         {
-            const copy = try allocator.dupe(u8, name);
-            try matches.append(allocator, copy);
-        }
-    }
-
-    // Prefer x86_64, then arm64/aarch64
-    for (matches.items) |name| {
-        if (std.mem.indexOf(u8, name, "x86_64") != null) {
             const file_name = try allocator.dupe(u8, name);
             errdefer allocator.free(file_name);
             const full_path = try std.fs.path.join(allocator, &.{ dist_dir, name });
             errdefer allocator.free(full_path);
-            return .{
-                .file_name = file_name,
-                .full_path = full_path,
-            };
-        }
-    }
-    for (matches.items) |name| {
-        if (std.mem.indexOf(u8, name, "arm64") != null or std.mem.indexOf(u8, name, "aarch64") != null) {
-            const file_name = try allocator.dupe(u8, name);
-            errdefer allocator.free(file_name);
-            const full_path = try std.fs.path.join(allocator, &.{ dist_dir, name });
-            errdefer allocator.free(full_path);
-            return .{
-                .file_name = file_name,
-                .full_path = full_path,
-            };
+            return .{ .file_name = file_name, .full_path = full_path };
         }
     }
 
-    // Fallback: return the first match
-    if (matches.items.len > 0) {
-        const name = matches.items[0];
-        const file_name = try allocator.dupe(u8, name);
-        errdefer allocator.free(file_name);
-        const full_path = try std.fs.path.join(allocator, &.{ dist_dir, name });
-        errdefer allocator.free(full_path);
-        return .{
-            .file_name = file_name,
-            .full_path = full_path,
-        };
-    }
-
-    log.err("no Windows zip found in {s} for {s}", .{ dist_dir, project_name });
+    log.warn("no Windows-{s} zip found in {s} for {s}", .{ arch, dist_dir, project_name });
     return error.ArtifactNotFound;
 }
 
@@ -445,4 +425,233 @@ fn writeFile(io: std.Io, path: []const u8, content: []const u8) ScoopPublishErro
     const f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return error.WriteError;
     defer f.close(io);
     f.writeStreamingAll(io, content) catch return error.WriteError;
+}
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
+
+test "findWindowsZipByArch finds x86_64 zip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create a fake x86_64 Windows zip
+    try tmp.dir.writeFile(io, .{ .sub_path = "mytool-1.0.0-windows-x86_64.zip", .data = "fake" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    // Build absolute path to tmp dir
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const tmp_path = buf[0..n];
+    const tmp_path_owned = try a.dupe(u8, tmp_path);
+
+    const result = try findWindowsZipByArch(a, tmp_path_owned, "mytool", "x86_64");
+    defer {
+        a.free(result.file_name);
+        a.free(result.full_path);
+    }
+
+    try std.testing.expectEqualStrings("mytool-1.0.0-windows-x86_64.zip", result.file_name);
+    try std.testing.expect(std.mem.endsWith(u8, result.full_path, "mytool-1.0.0-windows-x86_64.zip"));
+}
+
+test "findWindowsZipByArch finds aarch64 zip" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "mytool-1.0.0-windows-aarch64.zip", .data = "fake" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const tmp_path = buf[0..n];
+    const tmp_path_owned = try a.dupe(u8, tmp_path);
+
+    const result = try findWindowsZipByArch(a, tmp_path_owned, "mytool", "aarch64");
+    defer {
+        a.free(result.file_name);
+        a.free(result.full_path);
+    }
+
+    try std.testing.expectEqualStrings("mytool-1.0.0-windows-aarch64.zip", result.file_name);
+}
+
+test "findWindowsZipByArch returns ArtifactNotFound when arch missing" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Only x86_64 present — aarch64 lookup must fail
+    try tmp.dir.writeFile(io, .{ .sub_path = "mytool-1.0.0-windows-x86_64.zip", .data = "fake" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const tmp_path = buf[0..n];
+    const tmp_path_owned = try a.dupe(u8, tmp_path);
+
+    const result = findWindowsZipByArch(a, tmp_path_owned, "mytool", "aarch64");
+    try std.testing.expectError(error.ArtifactNotFound, result);
+}
+
+test "publishScoopManifest dry-run generates manifest with both architectures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create fake zip artifacts (content doesn't matter for SHA-256 correctness check,
+    // but we verify it ends up in the manifest)
+    try tmp.dir.writeFile(io, .{ .sub_path = "mytool-1.0.0-windows-x86_64.zip", .data = "x64content" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mytool-1.0.0-windows-aarch64.zip", .data = "arm64content" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const tmp_path = buf[0..n];
+    const tmp_path_owned = try a.dupe(u8, tmp_path);
+
+    var result = try publishScoopManifest(a, io, .{
+        .bucket = "vmvarela/scoop-bucket",
+        .owner = "vmvarela",
+        .repo = "mytool",
+        .tag = "v1.0.0",
+        .project_name = "mytool",
+        .description = "My tool description",
+        .homepage = "https://github.com/vmvarela/mytool",
+        .license = "MIT",
+        .dist_dir = tmp_path_owned,
+        .dry_run = true,
+    });
+    defer result.deinit(a);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(!result.pushed);
+
+    // Read and validate the generated manifest
+    const manifest_content = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        result.manifest_path,
+        a,
+        .limited(1024 * 1024),
+    ) catch return error.ReadError;
+
+    // Must contain 64bit URL
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "mytool-1.0.0-windows-x86_64.zip") != null);
+    // Must contain arm64 URL
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "mytool-1.0.0-windows-aarch64.zip") != null);
+    // Must contain both arch keys
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "\"64bit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "\"arm64\"") != null);
+    // Must contain version and metadata
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "\"version\": \"1.0.0\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "\"license\": \"MIT\"") != null);
+}
+
+test "publishScoopManifest dry-run generates manifest with x64 only when no arm64 artifact" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Only x86_64 artifact
+    try tmp.dir.writeFile(io, .{ .sub_path = "mytool-2.0.0-windows-x86_64.zip", .data = "x64only" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const tmp_path = buf[0..n];
+    const tmp_path_owned = try a.dupe(u8, tmp_path);
+
+    var result = try publishScoopManifest(a, io, .{
+        .bucket = "vmvarela/scoop-bucket",
+        .owner = "vmvarela",
+        .repo = "mytool",
+        .tag = "v2.0.0",
+        .project_name = "mytool",
+        .description = "My tool description",
+        .homepage = "https://github.com/vmvarela/mytool",
+        .license = "MIT",
+        .dist_dir = tmp_path_owned,
+        .dry_run = true,
+    });
+    defer result.deinit(a);
+
+    try std.testing.expect(result.success);
+    try std.testing.expect(!result.pushed);
+
+    const manifest_content = std.Io.Dir.cwd().readFileAlloc(
+        io,
+        result.manifest_path,
+        a,
+        .limited(1024 * 1024),
+    ) catch return error.ReadError;
+
+    // Must contain 64bit URL
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "mytool-2.0.0-windows-x86_64.zip") != null);
+    // Must NOT contain arm64 block
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "\"arm64\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, manifest_content, "\"version\": \"2.0.0\"") != null);
+}
+
+test "findWindowsZipByArch does not confuse x86_64 and aarch64" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Both arches present
+    try tmp.dir.writeFile(io, .{ .sub_path = "tool-1.0.0-windows-x86_64.zip", .data = "x64data" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tool-1.0.0-windows-aarch64.zip", .data = "arm64data" });
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const tmp_path = buf[0..n];
+    const tmp_path_owned = try a.dupe(u8, tmp_path);
+
+    const x64 = try findWindowsZipByArch(a, tmp_path_owned, "tool", "x86_64");
+    defer {
+        a.free(x64.file_name);
+        a.free(x64.full_path);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, x64.file_name, "x86_64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, x64.file_name, "aarch64") == null);
+
+    const arm = try findWindowsZipByArch(a, tmp_path_owned, "tool", "aarch64");
+    defer {
+        a.free(arm.file_name);
+        a.free(arm.full_path);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, arm.file_name, "aarch64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arm.file_name, "x86_64") == null);
 }

@@ -145,6 +145,17 @@ versions. Use the patterns below — do not use the old equivalents.
   or any allocator that supports aligned allocations. The main binary works
   fine because `main()` uses an arena; standalone test binaries using
   `page_allocator` will fail with `OutOfMemory` during process spawning.
+- **`std.Io.Dir` has no `realpath` method — use `realPath` (capital P).**
+  `realPath(dir, io, out_buffer)` returns `usize` (length written); slice
+  with `buf[0..n]` to get the path string. To resolve a sub-path within a
+  dir use `realPathFile(dir, io, sub_path, out_buffer) !usize`. Allocating
+  variants: `realPathFileAlloc(dir, io, sub_path, allocator) ![:0]u8`.
+  Pattern in tests:
+  ```zig
+  var buf: [std.fs.max_path_bytes]u8 = undefined;
+  const n = try tmp.dir.realPath(io, &buf);
+  const tmp_path = buf[0..n];
+  ```
 
 ## Release workflow (dogfooding)
 

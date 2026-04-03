@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+
+## [v0.4.1]
+
+### Added
+
+- Scoop publisher now includes a Windows arm64 artifact when present — generates `url_arm64` / `sha256_arm64` fields in the manifest; arm64 is optional and omitted when no `windows-aarch64` zip is found in `dist/`
+- `findWindowsZipByArch` helper replaces the old `findWindowsZip` — detects artifacts by explicit architecture token (`x86_64`, `aarch64`) instead of heuristic preference (#14)
+- Windows aarch64 added as a cross-compilation target in `takeoff.jsonc`
+- Integration tests for `publishScoopManifest` in dry-run mode (both-arch and x64-only scenarios)
+
+### Fixed
+
+- Scoop manifest was written to `dist/bucket/` during `takeoff build` but to `dist/scoop/` during `takeoff release` — both phases now consistently use `dist/scoop/`
+- Winget test no longer creates a stale `winget-out/` directory in the project root; output is written inside the test's `tmpDir` and cleaned up automatically
+
 ## [v0.4.0] - 2026-04-03
 
 ### Added

@@ -1,6 +1,6 @@
 .{
     .name = .takeoff,
-    .version = "0.4.0",
+    .version = "0.4.1",
     .fingerprint = 0x700432851e8b7674,
     .minimum_zig_version = "0.16.0-dev.3028+a85495ca2",
     .paths = .{

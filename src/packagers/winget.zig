@@ -361,7 +361,13 @@ test "generate writes three YAML files to output directory" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const output_dir = "winget-out";
+    // Use an absolute path inside the tmpDir so the test does not litter the
+    // working directory with a "winget-out" folder.
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &buf);
+    const tmp_path = buf[0..n];
+    const output_dir = try std.fs.path.join(allocator, &.{ tmp_path, "winget-out" });
+    defer allocator.free(output_dir);
 
     const cfg = WingetConfig{
         .publisher = "testpub",

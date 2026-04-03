@@ -508,12 +508,12 @@ pub fn generateScoopManifest(
     const description = cfg.project.description orelse cfg.project.name;
     const license = cfg.project.license orelse "Unknown";
 
-    // Build output path: {output_dir}/bucket/{name}.json
-    const bucket_dir = try std.fs.path.join(allocator, &.{ output_dir, "bucket" });
-    defer allocator.free(bucket_dir);
+    // Build output path: {output_dir}/scoop/{name}.json
+    const scoop_dir = try std.fs.path.join(allocator, &.{ output_dir, "scoop" });
+    defer allocator.free(scoop_dir);
     const manifest_name = try std.fmt.allocPrint(allocator, "{s}.json", .{cfg.project.name});
     defer allocator.free(manifest_name);
-    const output_path = try std.fs.path.join(allocator, &.{ bucket_dir, manifest_name });
+    const output_path = try std.fs.path.join(allocator, &.{ scoop_dir, manifest_name });
     defer allocator.free(output_path);
 
     const scoop_gen_cfg = packagers.scoop.ScoopConfig{
