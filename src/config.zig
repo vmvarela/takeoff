@@ -158,6 +158,8 @@ pub const GitHubRelease = struct {
 pub const AurRelease = struct {
     /// AUR package name. Defaults to the project name if not specified.
     repo: ?[]const u8 = null,
+    /// Maintainer string for the PKGBUILD header (e.g. "Name <email at domain dot tld>").
+    maintainer: ?[]const u8 = null,
     /// Optional SSH private key path for pushing to AUR.
     /// If absent, environment variable `AUR_SSH_KEY` is used.
     aur_ssh_key: ?[]const u8 = null,
@@ -292,6 +294,7 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             try allocator.dupe(u8, src.project.name) else null;
         const aur: ?AurRelease = if (aur_repo) |ar| AurRelease{
             .repo = ar,
+            .maintainer = try dupeOptStr(allocator, rel.aur.?.maintainer),
             .aur_ssh_key = try dupeOptStr(allocator, rel.aur.?.aur_ssh_key),
         } else null;
         break :blk Release{ .github = github, .aur = aur };
