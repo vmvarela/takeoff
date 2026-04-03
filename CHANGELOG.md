@@ -13,6 +13,19 @@ All notable changes to this project will be documented in this file.
 - `findWindowsZipByArch` helper replaces the old `findWindowsZip` — detects artifacts by explicit architecture token (`x86_64`, `aarch64`) instead of heuristic preference (#14)
 - Windows aarch64 added as a cross-compilation target in `takeoff.jsonc`
 - Integration tests for `publishScoopManifest` in dry-run mode (both-arch and x64-only scenarios)
+- `--all-publishers` / `--all` flag for `takeoff release` — enables all configured secondary publishers (aur, homebrew, scoop, winget, chocolatey) in a single invocation
+- `--no-github` flag for `takeoff release` — skips creating/updating the GitHub Release and uploading assets; looks up the existing release URL and runs only the secondary publishers. Useful for re-running a publisher (e.g. `--no-github --scoop`) when the GitHub Release already exists without re-uploading assets.
+- `ReleaseContext` abstraction (`src/release/context.zig`) — centralises release asset URL resolution for all secondary publishers; supports both a GitHub source (owner/repo/tag) and an explicit asset manifest, with `assetUrl()` and `repoGitUrl()` accessors
+- `src/metadata.zig` — metadata resolver with explicit precedence rules (package-level → `project` block → internal defaults) for description, maintainer, homepage, and license
+- `project.maintainer` and `project.url` optional fields in `takeoff.jsonc` — used as fallbacks when a package or publisher does not specify its own values
+- `release.source` and `release.manifest` fields in `takeoff.jsonc` — groundwork for non-GitHub asset sources; `source = "manifest"` will allow secondary publishers to consume a pre-built asset map instead of uploading to GitHub
+
+### Changed
+
+- All secondary publishers (AUR, Homebrew, Scoop, Winget) now receive a `*const ReleaseContext` instead of raw `owner`/`repo`/`tag` strings; asset download URLs are resolved through `ctx.assetUrl()` rather than assembled inline
+- Phase 2 of `takeoff release` (secondary publishers) now builds a `ReleaseContext` from the URL returned by Phase 1 and passes it to every publisher, making the release page URL the single source of truth
+- Dry-run preview of secondary publishers also uses a `ReleaseContext` so the output mirrors what the real run would produce
+- Publisher error sets (`AurError`, `HomebrewPublishError`, `ScoopPublishError`, `WingetPublishError`) extended with `AssetNotFound` and `InvalidManifest` to surface `ReleaseContext.assetUrl()` failures cleanly
 
 ### Fixed
 

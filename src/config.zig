@@ -36,6 +36,10 @@ pub const Project = struct {
     version: ?[]const u8 = null,
     description: ?[]const u8 = null,
     license: ?[]const u8 = null,
+    /// Global fallback for maintainer/packager fields across all packages.
+    maintainer: ?[]const u8 = null,
+    /// Global fallback for homepage/url fields across all packages.
+    url: ?[]const u8 = null,
 };
 
 pub const Build = struct {
@@ -224,6 +228,13 @@ pub const AurRelease = struct {
 pub const Release = struct {
     github: ?GitHubRelease = null,
     aur: ?AurRelease = null,
+    /// Asset source: `"github"` (default) or `"manifest"`.
+    /// When set to `"manifest"`, the `manifest` field must point to a JSON
+    /// file that provides the asset download URLs.  The GitHub upload phase
+    /// is skipped automatically.
+    source: ?[]const u8 = null,
+    /// Path to the manifest JSON file (required when `source = "manifest"`).
+    manifest: ?[]const u8 = null,
 };
 
 pub const Config = struct {
@@ -273,6 +284,8 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
         .version = try dupeOptStr(allocator, src.project.version),
         .description = try dupeOptStr(allocator, src.project.description),
         .license = try dupeOptStr(allocator, src.project.license),
+        .maintainer = try dupeOptStr(allocator, src.project.maintainer),
+        .url = try dupeOptStr(allocator, src.project.url),
     };
 
     const zig_version = try dupeOptStr(allocator, src.build.zig_version);
@@ -383,7 +396,12 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .maintainer = try dupeOptStr(allocator, rel.aur.?.maintainer),
             .aur_ssh_key = try dupeOptStr(allocator, rel.aur.?.aur_ssh_key),
         } else null;
-        break :blk Release{ .github = github, .aur = aur };
+        break :blk Release{
+            .github = github,
+            .aur = aur,
+            .source = try dupeOptStr(allocator, rel.source),
+            .manifest = try dupeOptStr(allocator, rel.manifest),
+        };
     } else null;
 
     return Config{
@@ -1158,4 +1176,48 @@ test "load parses packages.winget config" {
     try std.testing.expectEqualStrings("My awesome package", w.description.?);
     try std.testing.expectEqualStrings("https://example.com", w.homepage.?);
     try std.testing.expectEqualStrings("myuser/winget-pkgs", w.fork_repo.?);
+}
+
+test "load parses project.maintainer and project.url" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {
+        \\    "name": "mypkg",
+        \\    "description": "A great package",
+        \\    "maintainer": "Alice <alice@example.com>",
+        \\    "url": "https://example.com/mypkg"
+        \\  },
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}]
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+
+    try std.testing.expectEqualStrings("mypkg", cfg.project.name);
+    try std.testing.expectEqualStrings("A great package", cfg.project.description.?);
+    try std.testing.expectEqualStrings("Alice <alice@example.com>", cfg.project.maintainer.?);
+    try std.testing.expectEqualStrings("https://example.com/mypkg", cfg.project.url.?);
+}
+
+test "project.maintainer and project.url default to null when absent" {
+    const cfg = Config{
+        .project = .{ .name = "test" },
+        .targets = &[_]Target{.{ .os = "linux", .arch = "x86_64" }},
+    };
+    try std.testing.expect(cfg.project.maintainer == null);
+    try std.testing.expect(cfg.project.url == null);
 }

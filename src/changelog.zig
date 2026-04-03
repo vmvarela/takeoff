@@ -211,7 +211,7 @@ fn isArtifactFile(filename: []const u8) bool {
 }
 
 /// Free memory for artifact list.
-pub fn freeArtifacts(allocator: std.mem.Allocator, artifacts: [][]const u8) void {
+pub fn freeArtifacts(allocator: std.mem.Allocator, artifacts: []const []const u8) void {
     for (artifacts) |artifact| {
         allocator.free(artifact);
     }

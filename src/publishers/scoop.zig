@@ -8,10 +8,14 @@ const std = @import("std");
 
 const log = std.log.scoped(.scoop_publish);
 
+const ReleaseContext = @import("../release/context.zig").ReleaseContext;
+
 /// Error set for Scoop bucket publishing.
 pub const ScoopPublishError = error{
     InvalidConfig,
     ArtifactNotFound,
+    AssetNotFound,
+    InvalidManifest,
     ReadError,
     WriteError,
     ProcessError,
@@ -25,12 +29,8 @@ pub const ScoopPublishOptions = struct {
     /// Optional SSH private key for pushing.
     /// Falls back to SCOOP_BUCKET_SSH_KEY env var, then TAKEOFF_SSH_KEY.
     bucket_ssh_key: ?[]const u8 = null,
-    /// GitHub owner (for building URLs).
-    owner: []const u8,
-    /// GitHub repo (for building URLs).
-    repo: []const u8,
-    /// Release tag (e.g. "v0.2.0").
-    tag: []const u8,
+    /// Release context — source of asset download URLs and tag.
+    ctx: *const ReleaseContext,
     /// Project binary name.
     project_name: []const u8,
     /// Package description.
@@ -65,16 +65,14 @@ pub fn publishScoopManifest(
     opts: ScoopPublishOptions,
 ) ScoopPublishError!ScoopPublishResult {
     if (opts.bucket.len == 0) return error.InvalidConfig;
-    if (opts.owner.len == 0) return error.InvalidConfig;
-    if (opts.repo.len == 0) return error.InvalidConfig;
 
     const packagers = @import("../packagers/scoop.zig");
 
     // Normalise version (strip 'v' prefix)
-    const version = if (opts.tag.len > 0 and opts.tag[0] == 'v')
-        opts.tag[1..]
+    const version = if (opts.ctx.tag.len > 0 and opts.ctx.tag[0] == 'v')
+        opts.ctx.tag[1..]
     else
-        opts.tag;
+        opts.ctx.tag;
 
     // Find the x86_64 Windows zip (required)
     const x64_artifact = try findWindowsZipByArch(allocator, opts.dist_dir, opts.project_name, "x86_64");
@@ -86,11 +84,7 @@ pub fn publishScoopManifest(
     const sha256_x64 = try computeSha256(allocator, x64_artifact.full_path);
     defer allocator.free(sha256_x64);
 
-    const url_x64 = try std.fmt.allocPrint(
-        allocator,
-        "https://github.com/{s}/{s}/releases/download/{s}/{s}",
-        .{ opts.owner, opts.repo, opts.tag, x64_artifact.file_name },
-    );
+    const url_x64 = try opts.ctx.assetUrl(allocator, x64_artifact.file_name);
     defer allocator.free(url_x64);
 
     // Find the arm64 Windows zip (optional)
@@ -98,11 +92,7 @@ pub fn publishScoopManifest(
     var sha256_arm64: ?[]const u8 = null;
     if (findWindowsZipByArch(allocator, opts.dist_dir, opts.project_name, "aarch64")) |arm_artifact| {
         const sha = computeSha256(allocator, arm_artifact.full_path) catch null;
-        const url = std.fmt.allocPrint(
-            allocator,
-            "https://github.com/{s}/{s}/releases/download/{s}/{s}",
-            .{ opts.owner, opts.repo, opts.tag, arm_artifact.file_name },
-        ) catch null;
+        const url = opts.ctx.assetUrl(allocator, arm_artifact.file_name) catch null;
         allocator.free(arm_artifact.file_name);
         allocator.free(arm_artifact.full_path);
         url_arm64 = url;

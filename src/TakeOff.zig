@@ -19,6 +19,8 @@ pub const verify = @import("verify.zig");
 pub const changelog = @import("changelog.zig");
 pub const version = @import("version.zig");
 pub const publishers = @import("publishers/mod.zig");
+pub const metadata = @import("metadata.zig");
+pub const release_context = @import("release/context.zig");
 
 pub const CliError = error{
     InvalidArguments,

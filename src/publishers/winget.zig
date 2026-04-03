@@ -14,9 +14,14 @@ const github = @import("github.zig");
 
 const log = std.log.scoped(.winget_publish);
 
+const ReleaseContext = @import("../release/context.zig").ReleaseContext;
+
 /// Error set for Winget manifest publishing.
 pub const WingetPublishError = error{
     InvalidConfig,
+    ArtifactNotFound,
+    AssetNotFound,
+    InvalidManifest,
     ReadError,
     WriteError,
     ProcessError,
@@ -30,12 +35,13 @@ pub const WingetPublishError = error{
 pub const WingetPublishOptions = struct {
     /// Publisher name for PackageIdentifier (e.g. "vmvarela").
     publisher: []const u8,
-    /// GitHub owner (for building URLs and API calls).
+    /// GitHub owner — used for GitHub API calls (fork detection, PR).
+    /// For asset URLs, use `ctx.assetUrl()` instead.
     owner: []const u8,
-    /// GitHub repo (for building URLs and API calls).
+    /// GitHub repo — used for GitHub API calls (fork detection, PR).
     repo: []const u8,
-    /// Release tag (e.g. "v0.2.0").
-    tag: []const u8,
+    /// Release context — source of asset download URLs and tag.
+    ctx: *const ReleaseContext,
     /// Project binary name.
     project_name: []const u8,
     /// Package description.
@@ -87,10 +93,10 @@ pub fn publishWingetManifest(
     const packagers = @import("../packagers/winget.zig");
 
     // Normalise version (strip 'v' prefix)
-    const version = if (opts.tag.len > 0 and opts.tag[0] == 'v')
-        opts.tag[1..]
+    const version = if (opts.ctx.tag.len > 0 and opts.ctx.tag[0] == 'v')
+        opts.ctx.tag[1..]
     else
-        opts.tag;
+        opts.ctx.tag;
 
     // Find the Windows zip artifacts for SHA-256
     const x64_artifact = try findWindowsZip(allocator, io, opts.dist_dir, opts.project_name, "x86_64");
@@ -102,11 +108,7 @@ pub fn publishWingetManifest(
     const sha256_x64 = try computeSha256(allocator, x64_artifact.full_path);
     defer allocator.free(sha256_x64);
 
-    const download_url_x64 = try std.fmt.allocPrint(
-        allocator,
-        "https://github.com/{s}/{s}/releases/download/{s}/{s}",
-        .{ opts.owner, opts.repo, opts.tag, x64_artifact.file_name },
-    );
+    const download_url_x64 = try opts.ctx.assetUrl(allocator, x64_artifact.file_name);
     defer allocator.free(download_url_x64);
 
     // Try to find arm64 artifact (optional)
@@ -117,11 +119,7 @@ pub fn publishWingetManifest(
             allocator.free(arm64_artifact.file_name);
             allocator.free(arm64_artifact.full_path);
         }
-        const url = try std.fmt.allocPrint(
-            allocator,
-            "https://github.com/{s}/{s}/releases/download/{s}/{s}",
-            .{ opts.owner, opts.repo, opts.tag, arm64_artifact.file_name },
-        );
+        const url = try opts.ctx.assetUrl(allocator, arm64_artifact.file_name);
         download_url_arm64 = url;
         sha256_arm64 = try computeSha256(allocator, arm64_artifact.full_path);
     } else |_| {

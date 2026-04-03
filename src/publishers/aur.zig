@@ -2,10 +2,14 @@ const std = @import("std");
 
 const log = std.log.scoped(.aur);
 
+const ReleaseContext = @import("../release/context.zig").ReleaseContext;
+
 /// Error set for AUR publishing operations.
 pub const AurError = error{
     InvalidConfig,
     ArtifactNotFound,
+    AssetNotFound,
+    InvalidManifest,
     ReadError,
     WriteError,
     ProcessError,
@@ -21,12 +25,8 @@ pub const AurPublishOptions = struct {
     aur_ssh_key: ?[]const u8 = null,
     /// Maintainer string for the PKGBUILD header (e.g. "Name <email at domain dot tld>").
     maintainer: ?[]const u8 = null,
-    /// GitHub owner used to build source URL.
-    owner: []const u8,
-    /// GitHub repo used to build source URL.
-    repo: []const u8,
-    /// Release tag used to build source URL.
-    tag: []const u8,
+    /// Release context — source of asset download URLs and tag.
+    ctx: *const ReleaseContext,
     /// Project binary name (installed to /usr/bin/<name>).
     project_name: []const u8,
     /// Package description.
@@ -117,14 +117,10 @@ pub fn publishAurPackage(
         allocator.free(artifact.full_path);
     }
 
-    const pkgver = try normalizePkgver(allocator, opts.tag);
+    const pkgver = try normalizePkgver(allocator, opts.ctx.tag);
     defer allocator.free(pkgver);
 
-    const source_url = try std.fmt.allocPrint(
-        allocator,
-        "https://github.com/{s}/{s}/releases/download/{s}/{s}",
-        .{ opts.owner, opts.repo, opts.tag, artifact.file_name },
-    );
+    const source_url = try opts.ctx.assetUrl(allocator, artifact.file_name);
     defer allocator.free(source_url);
 
     const source_file = artifact.file_name;

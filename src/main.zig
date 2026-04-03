@@ -78,6 +78,10 @@ pub const ReleaseOptions = struct {
     winget: bool = false,
     /// Also push Chocolatey .nupkg to chocolatey.org after GitHub release.
     chocolatey: bool = false,
+    /// Skip creating/updating the GitHub Release and uploading assets.
+    /// Useful when re-running only secondary publishers (scoop, homebrew, etc.)
+    /// after a GitHub Release already exists.
+    no_github: bool = false,
     /// Path to dist directory (default: "dist")
     dist_dir: []const u8 = "dist",
     /// Path to CHANGELOG.md (default: "CHANGELOG.md")
@@ -300,6 +304,14 @@ pub const Command = union(enum) {
                     options.winget = true;
                 } else if (std.mem.eql(u8, opt, "--chocolatey")) {
                     options.chocolatey = true;
+                } else if (std.mem.eql(u8, opt, "--all-publishers") or std.mem.eql(u8, opt, "--all")) {
+                    options.aur = true;
+                    options.homebrew = true;
+                    options.scoop = true;
+                    options.winget = true;
+                    options.chocolatey = true;
+                } else if (std.mem.eql(u8, opt, "--no-github")) {
+                    options.no_github = true;
                 } else if (std.mem.eql(u8, opt, "--dist") or std.mem.eql(u8, opt, "-D")) {
                     i += 1;
                     if (i >= args.len) {
@@ -1100,18 +1112,21 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
     };
     defer allocator.free(notes);
 
-    // Find artifacts to upload
-    const artifacts = TakeOff.changelog.findArtifacts(allocator, io, opts.dist_dir) catch |err| {
-        stderr.print("Error: Failed to find artifacts: {s}\n", .{@errorName(err)}) catch {};
-        return 1;
-    };
-    defer TakeOff.changelog.freeArtifacts(allocator, artifacts);
-
-    if (artifacts.len == 0) {
-        stderr.print("Error: No artifacts found in {s}\n", .{opts.dist_dir}) catch {};
-        stderr.print("Run 'takeoff build' first to generate artifacts.\n", .{}) catch {};
-        return 1;
-    }
+    // Find artifacts to upload (not required when --no-github is set)
+    const artifacts = if (!opts.no_github) blk: {
+        const found = TakeOff.changelog.findArtifacts(allocator, io, opts.dist_dir) catch |err| {
+            stderr.print("Error: Failed to find artifacts: {s}\n", .{@errorName(err)}) catch {};
+            return 1;
+        };
+        if (found.len == 0) {
+            TakeOff.changelog.freeArtifacts(allocator, found);
+            stderr.print("Error: No artifacts found in {s}\n", .{opts.dist_dir}) catch {};
+            stderr.print("Run 'takeoff build' first to generate artifacts.\n", .{}) catch {};
+            return 1;
+        }
+        break :blk found;
+    } else &[_][]const u8{};
+    defer if (!opts.no_github) TakeOff.changelog.freeArtifacts(allocator, artifacts);
 
     // Convert artifact paths to relative names for upload
     const asset_names = allocator.alloc([]const u8, artifacts.len) catch {
@@ -1129,15 +1144,43 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
         stdout.print("\nDry run - would release:\n", .{}) catch {};
         stdout.print("  Repository: {s}/{s}\n", .{ gh.owner, gh.repo }) catch {};
         stdout.print("  Tag: {s}\n", .{tag}) catch {};
-        stdout.print("  Draft: {}\n", .{opts.draft}) catch {};
-        stdout.print("  Prerelease: {}\n", .{opts.prerelease}) catch {};
-        stdout.print("  Clean assets: {}\n", .{opts.clean_assets}) catch {};
-        stdout.print("  Replace assets: {}\n", .{opts.replace_assets}) catch {};
+        if (opts.no_github) {
+            stdout.print("  GitHub upload: skipped (--no-github)\n", .{}) catch {};
+        } else {
+            stdout.print("  Draft: {}\n", .{opts.draft}) catch {};
+            stdout.print("  Prerelease: {}\n", .{opts.prerelease}) catch {};
+            stdout.print("  Clean assets: {}\n", .{opts.clean_assets}) catch {};
+            stdout.print("  Replace assets: {}\n", .{opts.replace_assets}) catch {};
+        }
         stdout.print("  Publish AUR: {}\n", .{opts.aur}) catch {};
         stdout.print("\nRelease notes:\n{s}\n\n", .{notes}) catch {};
-        stdout.print("Artifacts to upload:\n", .{}) catch {};
-        for (artifacts) |artifact| {
-            stdout.print("  - {s}\n", .{std.fs.path.basename(artifact)}) catch {};
+
+        // Build a preview ReleaseContext for dry-run publisher calls.
+        const dry_release_page_url = std.fmt.allocPrint(
+            allocator,
+            "https://github.com/{s}/{s}/releases/tag/{s}",
+            .{ gh.owner, gh.repo, tag },
+        ) catch {
+            stderr.print("Error: Out of memory\n", .{}) catch {};
+            return 1;
+        };
+        defer allocator.free(dry_release_page_url);
+        var dry_ctx = TakeOff.release_context.ReleaseContext.fromGitHub(
+            allocator,
+            gh.owner,
+            gh.repo,
+            tag,
+            dry_release_page_url,
+        ) catch {
+            stderr.print("Error: Out of memory\n", .{}) catch {};
+            return 1;
+        };
+        defer dry_ctx.deinit();
+        if (!opts.no_github) {
+            stdout.print("Artifacts to upload:\n", .{}) catch {};
+            for (artifacts) |artifact| {
+                stdout.print("  - {s}\n", .{std.fs.path.basename(artifact)}) catch {};
+            }
         }
 
         if (opts.aur) {
@@ -1145,23 +1188,19 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             if (aur_cfg == null) {
                 stdout.print("\nAUR: skipped (release.aur not configured)\n", .{}) catch {};
             } else {
-                const project_desc = cfg.project.description orelse cfg.project.name;
-                const project_license = cfg.project.license orelse "unknown";
-                const gh_cfg = cfg.release.?.github.?;
-                const aur_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
-                defer if (aur_url.ptr != "".ptr) allocator.free(aur_url);
+                const md = TakeOff.metadata.resolve(cfg.project, .{
+                    .maintainer = aur_cfg.?.maintainer,
+                }, dry_ctx.repo_url);
 
                 const aur_opts = TakeOff.publishers.AurPublishOptions{
                     .aur_repo = aur_cfg.?.repo.?,
-                    .maintainer = aur_cfg.?.maintainer,
+                    .maintainer = md.maintainer,
                     .aur_ssh_key = aur_cfg.?.aur_ssh_key,
-                    .owner = gh_cfg.owner,
-                    .repo = gh_cfg.repo,
-                    .tag = tag,
+                    .ctx = &dry_ctx,
                     .project_name = cfg.project.name,
-                    .description = project_desc,
-                    .license = project_license,
-                    .url = aur_url,
+                    .description = md.description,
+                    .license = md.license,
+                    .url = md.homepage,
                     .dist_dir = opts.dist_dir,
                     .dry_run = true,
                 };
@@ -1184,22 +1223,20 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             if (hb_cfg == null) {
                 stdout.print("\nHomebrew: skipped (packages.homebrew not configured)\n", .{}) catch {};
             } else {
-                const project_desc = cfg.project.description orelse cfg.project.name;
-                const project_license = cfg.project.license orelse "unknown";
-                const gh_cfg = cfg.release.?.github.?;
-                const hb_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
-                defer if (hb_url.ptr != "".ptr) allocator.free(hb_url);
+                const hb = hb_cfg.?;
+                const md = TakeOff.metadata.resolve(cfg.project, .{
+                    .description = hb.description,
+                    .homepage = hb.homepage,
+                }, dry_ctx.repo_url);
 
                 const hb_opts = TakeOff.publishers.HomebrewPublishOptions{
-                    .tap = hb_cfg.?.getTap(),
-                    .tap_ssh_key = hb_cfg.?.tap_ssh_key,
-                    .owner = gh_cfg.owner,
-                    .repo = gh_cfg.repo,
-                    .tag = tag,
+                    .tap = hb.getTap(),
+                    .tap_ssh_key = hb.tap_ssh_key,
+                    .ctx = &dry_ctx,
                     .project_name = cfg.project.name,
-                    .description = hb_cfg.?.description orelse project_desc,
-                    .homepage = hb_cfg.?.homepage orelse hb_url,
-                    .license = project_license,
+                    .description = md.description,
+                    .homepage = md.homepage,
+                    .license = md.license,
                     .dist_dir = opts.dist_dir,
                     .dry_run = true,
                 };
@@ -1221,22 +1258,20 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             if (sc_cfg == null) {
                 stdout.print("\nScoop: skipped (packages.scoop not configured)\n", .{}) catch {};
             } else {
-                const project_desc = cfg.project.description orelse cfg.project.name;
-                const project_license = cfg.project.license orelse "unknown";
-                const gh_cfg = cfg.release.?.github.?;
-                const sc_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
-                defer if (sc_url.ptr != "".ptr) allocator.free(sc_url);
+                const sc = sc_cfg.?;
+                const md = TakeOff.metadata.resolve(cfg.project, .{
+                    .description = sc.description,
+                    .homepage = sc.homepage,
+                }, dry_ctx.repo_url);
 
                 const sc_opts = TakeOff.publishers.ScoopPublishOptions{
-                    .bucket = sc_cfg.?.getBucket(),
-                    .bucket_ssh_key = sc_cfg.?.bucket_ssh_key,
-                    .owner = gh_cfg.owner,
-                    .repo = gh_cfg.repo,
-                    .tag = tag,
+                    .bucket = sc.getBucket(),
+                    .bucket_ssh_key = sc.bucket_ssh_key,
+                    .ctx = &dry_ctx,
                     .project_name = cfg.project.name,
-                    .description = sc_cfg.?.description orelse project_desc,
-                    .homepage = sc_cfg.?.homepage orelse sc_url,
-                    .license = project_license,
+                    .description = md.description,
+                    .homepage = md.homepage,
+                    .license = md.license,
                     .dist_dir = opts.dist_dir,
                     .dry_run = true,
                 };
@@ -1258,27 +1293,28 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             if (wg_cfg == null) {
                 stdout.print("\nWinget: skipped (packages.winget not configured)\n", .{}) catch {};
             } else {
-                const project_desc = cfg.project.description orelse cfg.project.name;
-                const project_license = cfg.project.license orelse "unknown";
+                const wg = wg_cfg.?;
+                const md = TakeOff.metadata.resolve(cfg.project, .{
+                    .description = wg.description,
+                    .homepage = wg.homepage,
+                }, dry_ctx.repo_url);
                 const gh_cfg = cfg.release.?.github.?;
-                const wg_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
-                defer if (wg_url.ptr != "".ptr) allocator.free(wg_url);
 
                 const environ = std.Options.debug_threaded_io.?.environ.process_environ;
                 const github_token = std.process.Environ.getAlloc(environ, allocator, "GITHUB_TOKEN") catch "";
                 defer allocator.free(github_token);
 
                 const wg_opts = TakeOff.publishers.WingetPublishOptions{
-                    .publisher = wg_cfg.?.getPublisher(),
+                    .publisher = wg.getPublisher(),
                     .owner = gh_cfg.owner,
                     .repo = gh_cfg.repo,
-                    .tag = tag,
+                    .ctx = &dry_ctx,
                     .project_name = cfg.project.name,
-                    .description = wg_cfg.?.description orelse project_desc,
-                    .homepage = wg_cfg.?.homepage orelse wg_url,
-                    .license = project_license,
+                    .description = md.description,
+                    .homepage = md.homepage,
+                    .license = md.license,
                     .dist_dir = opts.dist_dir,
-                    .fork_repo = wg_cfg.?.fork_repo,
+                    .fork_repo = wg.fork_repo,
                     .github_token = github_token,
                     .dry_run = true,
                 };
@@ -1335,38 +1371,111 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
         return 0;
     }
 
-    // Publish the release
-    const release_opts = TakeOff.publishers.ReleaseOptions{
-        .owner = gh.owner,
-        .repo = gh.repo,
-        .tag = tag,
-        .name = tag,
-        .body = notes,
-        .draft = opts.draft,
-        .prerelease = opts.prerelease,
-    };
+    // -----------------------------------------------------------------
+    // Phase 1: GitHub Release (create/update + upload assets)
+    // Skipped when --no-github is set.
+    // -----------------------------------------------------------------
+    const release_html_url: []const u8 = if (opts.no_github) blk: {
+        // Lookup the existing release URL for informational output.
+        const environ = std.Options.debug_threaded_io.?.environ.process_environ;
+        const token = std.process.Environ.getAlloc(environ, allocator, "GITHUB_TOKEN") catch "";
+        defer allocator.free(token);
 
-    const result = TakeOff.publishers.publishRelease(
-        allocator,
-        io,
-        release_opts,
-        opts.dist_dir,
-        asset_names,
-        opts.clean_assets,
-        opts.replace_assets,
-    ) catch |err| {
-        stderr.print("Error: Release failed: {s}\n", .{@errorName(err)}) catch {};
-        return 1;
-    };
-    defer @constCast(&result).deinit(allocator);
+        if (token.len > 0) {
+            var client = TakeOff.publishers.GitHubClient.init(allocator, io, token) catch null;
+            if (client) |*c| {
+                defer c.deinit();
+                if (c.getReleaseByTag(gh.owner, gh.repo, tag) catch @as(?TakeOff.publishers.ReleaseInfo, null)) |rel| {
+                    var rel_mut = rel;
+                    const url = allocator.dupe(u8, rel_mut.html_url) catch {
+                        rel_mut.deinit(allocator);
+                        break :blk std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}/releases/tag/{s}", .{ gh.owner, gh.repo, tag }) catch {
+                            stderr.print("Error: Out of memory\n", .{}) catch {};
+                            return 1;
+                        };
+                    };
+                    rel_mut.deinit(allocator);
+                    break :blk url;
+                }
+            }
+        }
+        break :blk std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}/releases/tag/{s}", .{ gh.owner, gh.repo, tag }) catch {
+            stderr.print("Error: Out of memory\n", .{}) catch {};
+            return 1;
+        };
+    } else blk: {
+        // Publish the release (create or update) and upload assets.
+        const release_opts = TakeOff.publishers.ReleaseOptions{
+            .owner = gh.owner,
+            .repo = gh.repo,
+            .tag = tag,
+            .name = tag,
+            .body = notes,
+            .draft = opts.draft,
+            .prerelease = opts.prerelease,
+        };
 
-    if (result.success) {
+        const result = TakeOff.publishers.publishRelease(
+            allocator,
+            io,
+            release_opts,
+            opts.dist_dir,
+            asset_names,
+            opts.clean_assets,
+            opts.replace_assets,
+        ) catch |err| {
+            stderr.print("Error: Release failed: {s}\n", .{@errorName(err)}) catch {};
+            return 1;
+        };
+        defer @constCast(&result).deinit(allocator);
+
+        if (!result.success) {
+            stdout.print("\n⚠️  Release completed with errors:\n", .{}) catch {};
+            stdout.print("   URL: {s}\n", .{result.html_url}) catch {};
+            if (result.deleted_assets > 0) {
+                stdout.print("   Assets deleted: {d}\n", .{result.deleted_assets}) catch {};
+            }
+            stdout.print("   Assets uploaded: {d}\n", .{result.uploaded_assets}) catch {};
+            if (result.errors.len > 0) {
+                stdout.print("\n   Errors:\n", .{}) catch {};
+                for (result.errors) |err| {
+                    stdout.print("   - {s}\n", .{err}) catch {};
+                }
+            }
+            return 1;
+        }
+
         stdout.print("\n✅ Release published successfully!\n", .{}) catch {};
         stdout.print("   URL: {s}\n", .{result.html_url}) catch {};
         if (result.deleted_assets > 0) {
             stdout.print("   Assets deleted: {d}\n", .{result.deleted_assets}) catch {};
         }
         stdout.print("   Assets uploaded: {d}\n", .{result.uploaded_assets}) catch {};
+
+        break :blk allocator.dupe(u8, result.html_url) catch {
+            stderr.print("Error: Out of memory\n", .{}) catch {};
+            return 1;
+        };
+    };
+    defer allocator.free(release_html_url);
+
+    // -----------------------------------------------------------------
+    // Phase 2: Secondary publishers
+    // -----------------------------------------------------------------
+    {
+        // Build a ReleaseContext from the release URL produced in Phase 1.
+        // This is the single source of truth for asset URLs in all publishers.
+        var ctx = TakeOff.release_context.ReleaseContext.fromGitHub(
+            allocator,
+            gh.owner,
+            gh.repo,
+            tag,
+            release_html_url,
+        ) catch {
+            stderr.print("Error: Out of memory\n", .{}) catch {};
+            return 1;
+        };
+        defer ctx.deinit();
 
         if (opts.aur) {
             const aur_cfg = if (cfg.release) |rel| rel.aur else null;
@@ -1375,25 +1484,22 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 return 0;
             }
 
-            const project_desc = cfg.project.description orelse cfg.project.name;
-            const project_license = cfg.project.license orelse "unknown";
+            const md = TakeOff.metadata.resolve(cfg.project, .{
+                .maintainer = aur_cfg.?.maintainer,
+            }, ctx.repo_url);
 
-            const gh_cfg = cfg.release.?.github.?;
             const aur_opts = TakeOff.publishers.AurPublishOptions{
                 .aur_repo = aur_cfg.?.repo.?,
-                .maintainer = aur_cfg.?.maintainer,
+                .maintainer = md.maintainer,
                 .aur_ssh_key = aur_cfg.?.aur_ssh_key,
-                .owner = gh_cfg.owner,
-                .repo = gh_cfg.repo,
-                .tag = tag,
+                .ctx = &ctx,
                 .project_name = cfg.project.name,
-                .description = project_desc,
-                .license = project_license,
-                .url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "",
+                .description = md.description,
+                .license = md.license,
+                .url = md.homepage,
                 .dist_dir = opts.dist_dir,
                 .dry_run = false,
             };
-            defer if (aur_opts.url.ptr != "".ptr) allocator.free(aur_opts.url);
 
             var aur_result = TakeOff.publishers.publishAurPackage(allocator, io, aur_opts) catch |err| {
                 stderr.print("Warning: AUR publish failed: {s}\n", .{@errorName(err)}) catch {};
@@ -1413,24 +1519,23 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             if (hb_cfg == null) {
                 stderr.print("Warning: --homebrew requested but packages.homebrew is not configured. Skipping Homebrew publish.\n", .{}) catch {};
             } else {
-                const project_desc = cfg.project.description orelse cfg.project.name;
-                const project_license = cfg.project.license orelse "unknown";
-                const gh_cfg = cfg.release.?.github.?;
+                const hb = hb_cfg.?;
+                const md = TakeOff.metadata.resolve(cfg.project, .{
+                    .description = hb.description,
+                    .homepage = hb.homepage,
+                }, ctx.repo_url);
 
                 const hb_opts = TakeOff.publishers.HomebrewPublishOptions{
-                    .tap = hb_cfg.?.getTap(),
-                    .tap_ssh_key = hb_cfg.?.tap_ssh_key,
-                    .owner = gh_cfg.owner,
-                    .repo = gh_cfg.repo,
-                    .tag = tag,
+                    .tap = hb.getTap(),
+                    .tap_ssh_key = hb.tap_ssh_key,
+                    .ctx = &ctx,
                     .project_name = cfg.project.name,
-                    .description = hb_cfg.?.description orelse project_desc,
-                    .homepage = hb_cfg.?.homepage orelse std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "",
-                    .license = project_license,
+                    .description = md.description,
+                    .homepage = md.homepage,
+                    .license = md.license,
                     .dist_dir = opts.dist_dir,
                     .dry_run = false,
                 };
-                defer if (hb_opts.homepage.ptr != "".ptr) allocator.free(hb_opts.homepage);
 
                 var hb_result = TakeOff.publishers.publishHomebrewFormula(allocator, io, hb_opts) catch |err| {
                     stderr.print("Warning: Homebrew publish failed: {s}\n", .{@errorName(err)}) catch {};
@@ -1450,24 +1555,23 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             if (sc_cfg == null) {
                 stderr.print("Warning: --scoop requested but packages.scoop is not configured. Skipping Scoop publish.\n", .{}) catch {};
             } else {
-                const project_desc = cfg.project.description orelse cfg.project.name;
-                const project_license = cfg.project.license orelse "unknown";
-                const gh_cfg = cfg.release.?.github.?;
+                const sc = sc_cfg.?;
+                const md = TakeOff.metadata.resolve(cfg.project, .{
+                    .description = sc.description,
+                    .homepage = sc.homepage,
+                }, ctx.repo_url);
 
                 const sc_opts = TakeOff.publishers.ScoopPublishOptions{
-                    .bucket = sc_cfg.?.getBucket(),
-                    .bucket_ssh_key = sc_cfg.?.bucket_ssh_key,
-                    .owner = gh_cfg.owner,
-                    .repo = gh_cfg.repo,
-                    .tag = tag,
+                    .bucket = sc.getBucket(),
+                    .bucket_ssh_key = sc.bucket_ssh_key,
+                    .ctx = &ctx,
                     .project_name = cfg.project.name,
-                    .description = sc_cfg.?.description orelse project_desc,
-                    .homepage = sc_cfg.?.homepage orelse std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "",
-                    .license = project_license,
+                    .description = md.description,
+                    .homepage = md.homepage,
+                    .license = md.license,
                     .dist_dir = opts.dist_dir,
                     .dry_run = false,
                 };
-                defer if (sc_opts.homepage.ptr != "".ptr) allocator.free(sc_opts.homepage);
 
                 var sc_result = TakeOff.publishers.publishScoopManifest(allocator, io, sc_opts) catch |err| {
                     stderr.print("Warning: Scoop publish failed: {s}\n", .{@errorName(err)}) catch {};
@@ -1487,28 +1591,27 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
             if (wg_cfg == null) {
                 stderr.print("Warning: --winget requested but packages.winget is not configured. Skipping Winget publish.\n", .{}) catch {};
             } else {
-                const project_desc = cfg.project.description orelse cfg.project.name;
-                const project_license = cfg.project.license orelse "unknown";
-                const gh_cfg = cfg.release.?.github.?;
-
-                const wg_url = std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh_cfg.owner, gh_cfg.repo }) catch "";
-                defer if (wg_url.ptr != "".ptr) allocator.free(wg_url);
+                const wg = wg_cfg.?;
+                const md = TakeOff.metadata.resolve(cfg.project, .{
+                    .description = wg.description,
+                    .homepage = wg.homepage,
+                }, ctx.repo_url);
 
                 const environ = std.Options.debug_threaded_io.?.environ.process_environ;
                 const github_token = std.process.Environ.getAlloc(environ, allocator, "GITHUB_TOKEN") catch "";
                 defer allocator.free(github_token);
 
                 const wg_opts = TakeOff.publishers.WingetPublishOptions{
-                    .publisher = wg_cfg.?.getPublisher(),
-                    .owner = gh_cfg.owner,
-                    .repo = gh_cfg.repo,
-                    .tag = tag,
+                    .publisher = wg.getPublisher(),
+                    .owner = gh.owner,
+                    .repo = gh.repo,
+                    .ctx = &ctx,
                     .project_name = cfg.project.name,
-                    .description = wg_cfg.?.description orelse project_desc,
-                    .homepage = wg_cfg.?.homepage orelse wg_url,
-                    .license = project_license,
+                    .description = md.description,
+                    .homepage = md.homepage,
+                    .license = md.license,
                     .dist_dir = opts.dist_dir,
-                    .fork_repo = wg_cfg.?.fork_repo,
+                    .fork_repo = wg.fork_repo,
                     .github_token = github_token,
                     .dry_run = false,
                 };
@@ -1571,22 +1674,9 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 }
             }
         }
-        return 0;
-    } else {
-        stdout.print("\n⚠️  Release completed with errors:\n", .{}) catch {};
-        stdout.print("   URL: {s}\n", .{result.html_url}) catch {};
-        if (result.deleted_assets > 0) {
-            stdout.print("   Assets deleted: {d}\n", .{result.deleted_assets}) catch {};
-        }
-        stdout.print("   Assets uploaded: {d}\n", .{result.uploaded_assets}) catch {};
-        if (result.errors.len > 0) {
-            stdout.print("\n   Errors:\n", .{}) catch {};
-            for (result.errors) |err| {
-                stdout.print("   - {s}\n", .{err}) catch {};
-            }
-        }
-        return 1;
-    }
+    } // end Phase 2 secondary publishers
+
+    return 0;
 }
 
 const usage =
@@ -1639,6 +1729,12 @@ const usage =
     \\      --scoop      Generate Scoop manifest and push to bucket repo
     \\      --winget     Generate Winget manifest and open PR to winget-pkgs
     \\      --chocolatey Push Chocolatey .nupkg to chocolatey.org
+    \\      --all-publishers, --all
+    \\                   Enable all configured publishers (aur, homebrew, scoop,
+    \\                   winget, chocolatey)
+    \\      --no-github  Skip creating/updating the GitHub Release and uploading
+    \\                   assets. Use this to re-run only secondary publishers
+    \\                   (scoop, homebrew, etc.) when the release already exists.
     \\  -D, --dist DIR   Path to dist directory (default: "dist")
     \\  -c, --changelog  Path to CHANGELOG.md (default: "CHANGELOG.md")
     \\
@@ -1941,6 +2037,38 @@ test "Command.fromArgs parses release with --clean-assets" {
     }
 }
 
+test "Command.fromArgs parses release with --all-publishers" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--all-publishers" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.aur);
+            try std.testing.expect(opts.homebrew);
+            try std.testing.expect(opts.scoop);
+            try std.testing.expect(opts.winget);
+            try std.testing.expect(opts.chocolatey);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses release with --all (alias for --all-publishers)" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--all" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.aur);
+            try std.testing.expect(opts.homebrew);
+            try std.testing.expect(opts.scoop);
+            try std.testing.expect(opts.winget);
+            try std.testing.expect(opts.chocolatey);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
 test "Command.fromArgs rejects --clean-assets and --replace-assets together" {
     const prev_log_level = std.testing.log_level;
     defer std.testing.log_level = prev_log_level;
@@ -2075,4 +2203,60 @@ test "Command.fromArgs parses bump --zon" {
         },
         else => return error.UnexpectedCommand,
     }
+}
+
+test "Command.fromArgs parses release with --no-github" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--no-github" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.no_github);
+            // Other flags remain at defaults
+            try std.testing.expect(!opts.draft);
+            try std.testing.expect(!opts.prerelease);
+            try std.testing.expect(!opts.clean_assets);
+            try std.testing.expect(!opts.replace_assets);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses release with --no-github and --scoop" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--no-github", "--scoop" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.no_github);
+            try std.testing.expect(opts.scoop);
+            try std.testing.expect(!opts.aur);
+            try std.testing.expect(!opts.homebrew);
+            try std.testing.expect(!opts.winget);
+            try std.testing.expect(!opts.chocolatey);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "Command.fromArgs parses release with --no-github and --all" {
+    const allocator = std.testing.allocator;
+    const cmd = try Command.fromArgs(allocator, &[_][]const u8{ "release", "--no-github", "--all" });
+    defer cmd.deinit(allocator);
+    switch (cmd) {
+        .release => |opts| {
+            try std.testing.expect(opts.no_github);
+            try std.testing.expect(opts.aur);
+            try std.testing.expect(opts.homebrew);
+            try std.testing.expect(opts.scoop);
+            try std.testing.expect(opts.winget);
+            try std.testing.expect(opts.chocolatey);
+        },
+        else => return error.UnexpectedCommand,
+    }
+}
+
+test "ReleaseOptions no_github defaults to false" {
+    const opts = ReleaseOptions{};
+    try std.testing.expect(!opts.no_github);
 }

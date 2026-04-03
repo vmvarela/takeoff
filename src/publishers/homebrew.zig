@@ -8,10 +8,14 @@ const std = @import("std");
 
 const log = std.log.scoped(.homebrew_publish);
 
+const ReleaseContext = @import("../release/context.zig").ReleaseContext;
+
 /// Error set for Homebrew tap publishing.
 pub const HomebrewPublishError = error{
     InvalidConfig,
     ArtifactNotFound,
+    AssetNotFound,
+    InvalidManifest,
     ReadError,
     WriteError,
     ProcessError,
@@ -25,12 +29,8 @@ pub const HomebrewPublishOptions = struct {
     /// Optional SSH private key for pushing.
     /// Falls back to HOMEBREW_TAP_SSH_KEY env var.
     tap_ssh_key: ?[]const u8 = null,
-    /// GitHub owner (for building URLs).
-    owner: []const u8,
-    /// GitHub repo (for building URLs).
-    repo: []const u8,
-    /// Release tag (e.g. "v0.2.0").
-    tag: []const u8,
+    /// Release context — source of asset download URLs and repo metadata.
+    ctx: *const ReleaseContext,
     /// Project binary name.
     project_name: []const u8,
     /// Package description.
@@ -65,8 +65,6 @@ pub fn publishHomebrewFormula(
     opts: HomebrewPublishOptions,
 ) HomebrewPublishError!HomebrewPublishResult {
     if (opts.tap.len == 0) return error.InvalidConfig;
-    if (opts.owner.len == 0) return error.InvalidConfig;
-    if (opts.repo.len == 0) return error.InvalidConfig;
 
     const packagers = @import("../packagers/homebrew.zig");
 
@@ -78,21 +76,13 @@ pub fn publishHomebrewFormula(
     }
 
     // Normalise version (strip 'v' prefix)
-    const version = if (std.mem.startsWith(u8, opts.tag, "v")) opts.tag[1..] else opts.tag;
+    const version = if (std.mem.startsWith(u8, opts.ctx.tag, "v")) opts.ctx.tag[1..] else opts.ctx.tag;
 
-    // Build URLs
-    const tarball_url = try std.fmt.allocPrint(
-        allocator,
-        "https://github.com/{s}/{s}/releases/download/{s}/{s}",
-        .{ opts.owner, opts.repo, opts.tag, artifact.file_name },
-    );
+    // Build URLs via ReleaseContext
+    const tarball_url = try opts.ctx.assetUrl(allocator, artifact.file_name);
     defer allocator.free(tarball_url);
 
-    const head_url = try std.fmt.allocPrint(
-        allocator,
-        "https://github.com/{s}/{s}.git",
-        .{ opts.owner, opts.repo },
-    );
+    const head_url = try opts.ctx.repoGitUrl(allocator);
     defer allocator.free(head_url);
 
     const sha256_hex = std.fmt.bytesToHex(artifact.sha256, .lower);
