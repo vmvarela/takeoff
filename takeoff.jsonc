@@ -68,7 +68,10 @@
             "fork_repo": "vmvarela/winget-pkgs"
         },
         // Chocolatey package — portable CLI package for Windows
-        "chocolatey": {}
+        "chocolatey": {
+            "authors": "Victor M. Varela",
+            "tags": "takeoff zig release automation portable cli"
+        }
     },
 
     // GitHub Release configuration
