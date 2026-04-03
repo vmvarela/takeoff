@@ -58,8 +58,10 @@
             "owner": "vmvarela",
             "repo": "takeoff"
         },
+        // AUR package — defaults to project name ("takeoff")
+        // Override with: "aur": { "repo": "takeoff-bin" }
         "aur": {
-            "repo": "takeoff-bin"
+            "maintainer": "Victor M. Varela <vmvarela at gmail dot com>"
             // Optional: path to AUR SSH key for push
             // "aur_ssh_key": "/home/you/.ssh/aur"
         }

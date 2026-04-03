@@ -14,11 +14,13 @@ pub const AurError = error{
 
 /// Options for generating (and optionally pushing) an AUR package repository.
 pub const AurPublishOptions = struct {
-    /// AUR repository name (must be the package name, usually ending with `-bin`).
+    /// AUR package name (e.g. `takeoff` or `takeoff-bin`).
     aur_repo: []const u8,
     /// Optional SSH private key path to push to AUR.
     /// If null, `AUR_SSH_KEY` environment variable is used if present.
     aur_ssh_key: ?[]const u8 = null,
+    /// Maintainer string for the PKGBUILD header (e.g. "Name <email at domain dot tld>").
+    maintainer: ?[]const u8 = null,
     /// GitHub owner used to build source URL.
     owner: []const u8,
     /// GitHub repo used to build source URL.
@@ -60,6 +62,32 @@ const ArtifactInfo = struct {
     sha256: [32]u8,
 };
 
+/// 0BSD license for AUR package sources (per RFC 40 / RFC 52).
+const aurLicenseContent =
+    \\Permission to use, copy, modify, and/or distribute this software
+    \\for any purpose with or without fee is hereby granted.
+    \\
+    \\THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL
+    \\WARRANTIES WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED
+    \\WARRANTIES OF MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE
+    \\AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT, INDIRECT, OR
+    \\CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+    \\LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT,
+    \\NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF OR IN
+    \\CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+;
+
+/// REUSE.toml for AUR package sources (per RFC 52).
+const reuseTomlContent =
+    \\version = 1
+    \\
+    \\[[annotations]]
+    \\path = ["PKGBUILD", ".SRCINFO"]
+    \\precedence = "aggregate"
+    \\SPDX-FileCopyrightText = "NONE"
+    \\SPDX-License-Identifier = "0BSD"
+;
+
 const AurMetadata = struct {
     pkgname: []const u8,
     pkgver: []const u8,
@@ -72,6 +100,7 @@ const AurMetadata = struct {
     source_file: []const u8,
     sha256: []const u8,
     project_name: []const u8,
+    maintainer: ?[]const u8 = null,
 };
 
 /// Generate PKGBUILD + .SRCINFO for AUR, and optionally push to AUR.
@@ -81,7 +110,6 @@ pub fn publishAurPackage(
     opts: AurPublishOptions,
 ) AurError!AurPublishResult {
     if (opts.aur_repo.len == 0) return error.InvalidConfig;
-    if (!std.mem.endsWith(u8, opts.aur_repo, "-bin")) return error.InvalidConfig;
 
     const artifact = try findLinuxX8664Tarball(allocator, io, opts.dist_dir, opts.project_name);
     defer {
@@ -114,6 +142,7 @@ pub fn publishAurPackage(
         .source_file = source_file,
         .sha256 = &sha256,
         .project_name = opts.project_name,
+        .maintainer = opts.maintainer,
     };
 
     const aur_dir = try std.fs.path.join(allocator, &.{ opts.dist_dir, "aur", opts.aur_repo });
@@ -136,10 +165,20 @@ pub fn publishAurPackage(
     defer allocator.free(srcinfo_content);
     try writeFile(io, srcinfo_path, srcinfo_content);
 
+    // Write LICENSE (0BSD) per AUR submission guidelines (RFC 40 / RFC 52)
+    const license_path = try std.fs.path.join(allocator, &.{ aur_dir, "LICENSE" });
+    errdefer allocator.free(license_path);
+    try writeFile(io, license_path, aurLicenseContent);
+
+    // Write REUSE.toml per AUR submission guidelines (RFC 52)
+    const reuse_path = try std.fs.path.join(allocator, &.{ aur_dir, "REUSE.toml" });
+    errdefer allocator.free(reuse_path);
+    try writeFile(io, reuse_path, reuseTomlContent);
+
     if (opts.dry_run) {
         const msg = try std.fmt.allocPrint(
             allocator,
-            "generated PKGBUILD and .SRCINFO (dry-run, no push): {s}",
+            "generated PKGBUILD, .SRCINFO, LICENSE, and REUSE.toml (dry-run, no push): {s}",
             .{aur_dir},
         );
         return .{
@@ -154,18 +193,7 @@ pub fn publishAurPackage(
     const ssh_key = resolveSshKey(allocator, opts.aur_ssh_key) catch null;
     defer if (ssh_key) |k| allocator.free(k);
 
-    if (ssh_key == null) {
-        const msg = try allocator.dupe(u8, "generated PKGBUILD/.SRCINFO; AUR push skipped (no aur_ssh_key and no AUR_SSH_KEY)");
-        return .{
-            .success = true,
-            .pkgbuild_path = pkgbuild_path,
-            .srcinfo_path = srcinfo_path,
-            .pushed = false,
-            .message = msg,
-        };
-    }
-
-    const push_ok = pushToAur(allocator, io, opts.aur_repo, ssh_key.?, pkgbuild_path, srcinfo_path, pkgver) catch {
+    const push_ok = pushToAur(allocator, io, opts.aur_repo, ssh_key, aur_dir, pkgver) catch {
         const msg = try allocator.dupe(u8, "generated PKGBUILD/.SRCINFO but failed to push to AUR");
         return .{
             .success = false,
@@ -243,9 +271,15 @@ fn normalizePkgver(allocator: std.mem.Allocator, tag: []const u8) std.mem.Alloca
 }
 
 fn renderPkgbuild(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocator.Error![]const u8 {
+    const maintainer_line = if (md.maintainer) |m|
+        try std.fmt.allocPrint(allocator, "# Maintainer: {s}\n", .{m})
+    else
+        try allocator.dupe(u8, "# Maintainer: Generated by takeoff\n");
+    defer allocator.free(maintainer_line);
+
     return std.fmt.allocPrint(
         allocator,
-        "# Maintainer: Generated by takeoff\n" ++
+        "{s}" ++
             "pkgname={s}\n" ++
             "pkgver={s}\n" ++
             "pkgrel={s}\n" ++
@@ -253,23 +287,21 @@ fn renderPkgbuild(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocat
             "arch=('{s}')\n" ++
             "url=\"{s}\"\n" ++
             "license=('{s}')\n" ++
-            "provides=('{s}')\n" ++
-            "conflicts=('{s}')\n" ++
             "options=('!strip')\n" ++
             "source=(\"{s}\")\n" ++
             "sha256sums=('{s}')\n" ++
             "\n" ++
             "package() {{\n" ++
-            "  local _bin\n" ++
-            "  _bin=\"$(find \"$srcdir\" -type f -path \"*/bin/{s}\" -print -quit)\"\n" ++
-            "  [[ -n \"$_bin\" ]] || {{ echo \"binary not found in source archive\"; return 1; }}\n" ++
+            "  local _dir=\"{s}-{s}\"\n" ++
             "\n" ++
-            "  install -Dm755 \"$_bin\" \"$pkgdir/usr/bin/{s}\"\n" ++
+            "  install -Dm755 \"$srcdir/$_dir/bin/{s}\" \"$pkgdir/usr/bin/{s}\"\n" ++
+            "\n" ++
+            "  install -Dm644 \"$srcdir/$_dir/LICENSE\" \"$pkgdir/usr/share/licenses/{s}/LICENSE\"\n" ++
             "\n" ++
             "  while IFS= read -r -d '' _f; do\n" ++
             "    local _rel=\"${{_f#*/man/}}\"\n" ++
             "    install -Dm644 \"$_f\" \"$pkgdir/usr/share/man/${{_rel}}\"\n" ++
-            "  done < <(find \"$srcdir\" -type f -path \"*/man/*\" -print0)\n" ++
+            "  done < <(find \"$srcdir/$_dir\" -type f -path \"*/man/*\" -print0)\n" ++
             "\n" ++
             "  while IFS= read -r -d '' _f; do\n" ++
             "    if [[ \"$_f\" == */completions/bash/* ]]; then\n" ++
@@ -282,9 +314,10 @@ fn renderPkgbuild(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocat
             "      local _rel=\"${{_f#*/completions/fish/}}\"\n" ++
             "      install -Dm644 \"$_f\" \"$pkgdir/usr/share/fish/vendor_completions.d/${{_rel}}\"\n" ++
             "    fi\n" ++
-            "  done < <(find \"$srcdir\" -type f -path \"*/completions/*\" -print0)\n" ++
+            "  done < <(find \"$srcdir/$_dir\" -type f -path \"*/completions/*\" -print0)\n" ++
             "}}\n",
         .{
+            maintainer_line,
             md.pkgname,
             md.pkgver,
             md.pkgrel,
@@ -292,10 +325,11 @@ fn renderPkgbuild(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocat
             md.arch,
             md.url,
             md.license,
-            md.project_name,
-            md.project_name,
             md.source_url,
             md.sha256,
+            md.project_name,
+            md.pkgver,
+            md.project_name,
             md.project_name,
             md.project_name,
         },
@@ -312,8 +346,6 @@ fn renderSrcinfo(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocato
             "\turl = {s}\n" ++
             "\tarch = {s}\n" ++
             "\tlicense = {s}\n" ++
-            "\tprovides = {s}\n" ++
-            "\tconflicts = {s}\n" ++
             "\toptions = !strip\n" ++
             "\tsource = {s}\n" ++
             "\tsha256sums = {s}\n" ++
@@ -327,8 +359,6 @@ fn renderSrcinfo(allocator: std.mem.Allocator, md: AurMetadata) std.mem.Allocato
             md.url,
             md.arch,
             md.license,
-            md.project_name,
-            md.project_name,
             md.source_url,
             md.sha256,
             md.pkgname,
@@ -380,9 +410,8 @@ fn pushToAur(
     allocator: std.mem.Allocator,
     io: std.Io,
     aur_repo: []const u8,
-    ssh_key: []const u8,
-    pkgbuild_path: []const u8,
-    srcinfo_path: []const u8,
+    ssh_key: ?[]const u8,
+    aur_dir: []const u8,
     pkgver: []const u8,
 ) AurError!bool {
     const tmp_dir = try std.fmt.allocPrint(allocator, "/tmp/takeoff-aur-{s}-{s}", .{ aur_repo, pkgver });
@@ -392,34 +421,52 @@ fn pushToAur(
     const repo_url = try std.fmt.allocPrint(allocator, "ssh://aur@aur.archlinux.org/{s}.git", .{aur_repo});
     defer allocator.free(repo_url);
 
-    const ssh_cmd = try std.fmt.allocPrint(allocator, "ssh -i \"{s}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", .{ssh_key});
-    defer allocator.free(ssh_cmd);
+    const ssh_cmd = if (ssh_key) |key|
+        try std.fmt.allocPrint(allocator, "ssh -i \"{s}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", .{key})
+    else
+        null;
+    defer if (ssh_cmd) |s| allocator.free(s);
 
-    const clone_cmd = try std.fmt.allocPrint(
-        allocator,
-        "GIT_SSH_COMMAND='{s}' git clone \"{s}\" \"{s}\"",
-        .{ ssh_cmd, repo_url, tmp_dir },
-    );
+    const clone_cmd = if (ssh_cmd) |s|
+        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git clone \"{s}\" \"{s}\"", .{ s, repo_url, tmp_dir })
+    else
+        try std.fmt.allocPrint(allocator, "git clone \"{s}\" \"{s}\"", .{ repo_url, tmp_dir });
     defer allocator.free(clone_cmd);
     try runShell(allocator, io, clone_cmd);
 
-    const copy_pkgbuild_cmd = try std.fmt.allocPrint(
+    // Copy all generated files from aur_dir to the cloned repo
+    const copy_cmd = try std.fmt.allocPrint(
         allocator,
-        "cp \"{s}\" \"{s}/PKGBUILD\"",
-        .{ pkgbuild_path, tmp_dir },
+        "cp \"{s}/PKGBUILD\" \"{s}/.SRCINFO\" \"{s}\"",
+        .{ aur_dir, aur_dir, tmp_dir },
     );
-    defer allocator.free(copy_pkgbuild_cmd);
-    try runShell(allocator, io, copy_pkgbuild_cmd);
+    defer allocator.free(copy_cmd);
+    try runShell(allocator, io, copy_cmd);
 
-    const copy_srcinfo_cmd = try std.fmt.allocPrint(
+    // Copy LICENSE and REUSE.toml if they exist in aur_dir
+    const copy_license_cmd = try std.fmt.allocPrint(
         allocator,
-        "cp \"{s}\" \"{s}/.SRCINFO\"",
-        .{ srcinfo_path, tmp_dir },
+        "test -f \"{s}/LICENSE\" && cp \"{s}/LICENSE\" \"{s}/LICENSE\" || true",
+        .{ aur_dir, aur_dir, tmp_dir },
     );
-    defer allocator.free(copy_srcinfo_cmd);
-    try runShell(allocator, io, copy_srcinfo_cmd);
+    defer allocator.free(copy_license_cmd);
+    try runShell(allocator, io, copy_license_cmd);
 
-    const add_cmd = try std.fmt.allocPrint(allocator, "git -C \"{s}\" add PKGBUILD .SRCINFO", .{tmp_dir});
+    const copy_reuse_cmd = try std.fmt.allocPrint(
+        allocator,
+        "test -f \"{s}/REUSE.toml\" && cp \"{s}/REUSE.toml\" \"{s}/REUSE.toml\" || true",
+        .{ aur_dir, aur_dir, tmp_dir },
+    );
+    defer allocator.free(copy_reuse_cmd);
+    try runShell(allocator, io, copy_reuse_cmd);
+
+    const add_cmd = try std.fmt.allocPrint(
+        allocator,
+        "git -C \"{s}\" add PKGBUILD .SRCINFO && " ++
+            "(test -f \"{s}/LICENSE\" && git -C \"{s}\" add LICENSE || true) && " ++
+            "(test -f \"{s}/REUSE.toml\" && git -C \"{s}\" add REUSE.toml || true)",
+        .{ tmp_dir, tmp_dir, tmp_dir, tmp_dir, tmp_dir },
+    );
     defer allocator.free(add_cmd);
     try runShell(allocator, io, add_cmd);
 
@@ -436,11 +483,10 @@ fn pushToAur(
     defer allocator.free(commit_cmd);
     try runShell(allocator, io, commit_cmd);
 
-    const push_cmd = try std.fmt.allocPrint(
-        allocator,
-        "GIT_SSH_COMMAND='{s}' git -C \"{s}\" push",
-        .{ ssh_cmd, tmp_dir },
-    );
+    const push_cmd = if (ssh_cmd) |s|
+        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git -C \"{s}\" push", .{ s, tmp_dir })
+    else
+        try std.fmt.allocPrint(allocator, "git -C \"{s}\" push", .{tmp_dir});
     defer allocator.free(push_cmd);
     try runShell(allocator, io, push_cmd);
 
@@ -496,7 +542,7 @@ test "normalizePkgver strips leading v and maps hyphen to underscore" {
 test "renderPkgbuild includes required install paths" {
     const allocator = std.testing.allocator;
     const md = AurMetadata{
-        .pkgname = "mytool-bin",
+        .pkgname = "mytool",
         .pkgver = "1.0.0",
         .pkgrel = "1",
         .pkgdesc = "My tool",
@@ -512,17 +558,21 @@ test "renderPkgbuild includes required install paths" {
     const content = try renderPkgbuild(allocator, md);
     defer allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname=mytool-bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname=mytool") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "install -Dm755") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/usr/share/man") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/usr/share/bash-completion/completions") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "-path \"*/bin/mytool\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "$srcdir/$_dir/bin/mytool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "/usr/share/licenses/mytool/LICENSE") != null);
+    // Must NOT contain redundant provides/conflicts for self
+    try std.testing.expect(std.mem.indexOf(u8, content, "provides=") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "conflicts=") == null);
 }
 
 test "renderSrcinfo includes pkgbase and pkgname" {
     const allocator = std.testing.allocator;
     const md = AurMetadata{
-        .pkgname = "mytool-bin",
+        .pkgname = "mytool",
         .pkgver = "1.0.0",
         .pkgrel = "1",
         .pkgdesc = "My tool",
@@ -538,6 +588,9 @@ test "renderSrcinfo includes pkgbase and pkgname" {
     const content = try renderSrcinfo(allocator, md);
     defer allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "pkgbase = mytool-bin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname = mytool-bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "pkgbase = mytool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname = mytool") != null);
+    // Must NOT contain redundant provides/conflicts for self
+    try std.testing.expect(std.mem.indexOf(u8, content, "provides =") == null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "conflicts =") == null);
 }

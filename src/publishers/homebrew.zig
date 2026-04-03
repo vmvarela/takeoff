@@ -143,26 +143,12 @@ pub fn publishHomebrewFormula(
         };
     }
 
-    // Resolve SSH key
+    // Resolve SSH key — if null, SSH will use ~/.ssh/config defaults
     const ssh_key = resolveSshKey(allocator, opts.tap_ssh_key) catch null;
     defer if (ssh_key) |k| allocator.free(k);
 
-    if (ssh_key == null) {
-        log.warn("tap push skipped: no SSH key found — set 'tap_ssh_key' in takeoff.jsonc or the HOMEBREW_TAP_SSH_KEY environment variable", .{});
-        const msg = try allocator.dupe(
-            u8,
-            "generated formula; tap push skipped (no tap_ssh_key and no HOMEBREW_TAP_SSH_KEY)",
-        );
-        return .{
-            .success = true,
-            .formula_path = formula_path,
-            .pushed = false,
-            .message = msg,
-        };
-    }
-
     // Parse tap repo: "owner/repo" → clone URL
-    const clone_url = try buildCloneUrl(allocator, opts.tap, ssh_key.?);
+    const clone_url = try buildCloneUrl(allocator, opts.tap);
     defer allocator.free(clone_url);
 
     // Push to tap
@@ -171,7 +157,7 @@ pub fn publishHomebrewFormula(
         io,
         opts.tap,
         clone_url,
-        ssh_key.?,
+        ssh_key,
         opts.project_name,
         formula_name,
         formula_content,
@@ -230,9 +216,7 @@ fn renderFormula(
 fn buildCloneUrl(
     allocator: std.mem.Allocator,
     tap: []const u8,
-    ssh_key: []const u8,
 ) HomebrewPublishError![]const u8 {
-    _ = ssh_key; // unused for URL construction, kept for signature clarity
     // Parse "owner/repo"
     const slash = std.mem.indexOfScalar(u8, tap, '/') orelse {
         // Just a repo name — assume GitHub convention
@@ -259,7 +243,7 @@ fn pushToTap(
     io: std.Io,
     tap: []const u8,
     clone_url: []const u8,
-    ssh_key: []const u8,
+    ssh_key: ?[]const u8,
     project_name: []const u8,
     formula_name: []const u8,
     formula_content: []const u8,
@@ -269,19 +253,17 @@ fn pushToTap(
     defer allocator.free(tmp_dir);
     std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch return error.WriteError;
 
-    const ssh_cmd = try std.fmt.allocPrint(
-        allocator,
-        "ssh -i \"{s}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new",
-        .{ssh_key},
-    );
-    defer allocator.free(ssh_cmd);
+    const ssh_cmd = if (ssh_key) |key|
+        try std.fmt.allocPrint(allocator, "ssh -i \"{s}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", .{key})
+    else
+        null;
+    defer if (ssh_cmd) |s| allocator.free(s);
 
     // Clone
-    const clone_cmd = try std.fmt.allocPrint(
-        allocator,
-        "GIT_SSH_COMMAND='{s}' git clone \"{s}\" \"{s}\"",
-        .{ ssh_cmd, clone_url, tmp_dir },
-    );
+    const clone_cmd = if (ssh_cmd) |s|
+        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git clone \"{s}\" \"{s}\"", .{ s, clone_url, tmp_dir })
+    else
+        try std.fmt.allocPrint(allocator, "git clone \"{s}\" \"{s}\"", .{ clone_url, tmp_dir });
     defer allocator.free(clone_cmd);
     try runShell(allocator, io, clone_cmd);
 
@@ -332,11 +314,10 @@ fn pushToTap(
     try runShell(allocator, io, commit_cmd);
 
     // Push
-    const push_cmd = try std.fmt.allocPrint(
-        allocator,
-        "GIT_SSH_COMMAND='{s}' git -C \"{s}\" push",
-        .{ ssh_cmd, tmp_dir },
-    );
+    const push_cmd = if (ssh_cmd) |s|
+        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git -C \"{s}\" push", .{ s, tmp_dir })
+    else
+        try std.fmt.allocPrint(allocator, "git -C \"{s}\" push", .{tmp_dir});
     defer allocator.free(push_cmd);
     try runShell(allocator, io, push_cmd);
 
@@ -386,14 +367,14 @@ fn writeFile(io: std.Io, path: []const u8, content: []const u8) HomebrewPublishE
 
 test "buildCloneUrl parses owner/repo" {
     const allocator = std.testing.allocator;
-    const url = try buildCloneUrl(allocator, "vmvarela/homebrew-tap", "key");
+    const url = try buildCloneUrl(allocator, "vmvarela/homebrew-tap");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("git@github.com:vmvarela/homebrew-tap.git", url);
 }
 
 test "buildCloneUrl handles bare repo name" {
     const allocator = std.testing.allocator;
-    const url = try buildCloneUrl(allocator, "homebrew-tap", "key");
+    const url = try buildCloneUrl(allocator, "homebrew-tap");
     defer allocator.free(url);
     try std.testing.expectEqualStrings("git@github.com:homebrew-tap/homebrew-tap.git", url);
 }
