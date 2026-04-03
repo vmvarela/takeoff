@@ -1140,7 +1140,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 defer if (aur_url.ptr != "".ptr) allocator.free(aur_url);
 
                 const aur_opts = TakeOff.publishers.AurPublishOptions{
-                    .aur_repo = aur_cfg.?.repo,
+                    .aur_repo = aur_cfg.?.repo.?,
                     .aur_ssh_key = aur_cfg.?.aur_ssh_key,
                     .owner = gh_cfg.owner,
                     .repo = gh_cfg.repo,
@@ -1250,7 +1250,7 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
 
             const gh_cfg = cfg.release.?.github.?;
             const aur_opts = TakeOff.publishers.AurPublishOptions{
-                .aur_repo = aur_cfg.?.repo,
+                .aur_repo = aur_cfg.?.repo.?,
                 .aur_ssh_key = aur_cfg.?.aur_ssh_key,
                 .owner = gh_cfg.owner,
                 .repo = gh_cfg.repo,

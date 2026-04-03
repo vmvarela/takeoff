@@ -14,7 +14,7 @@ pub const AurError = error{
 
 /// Options for generating (and optionally pushing) an AUR package repository.
 pub const AurPublishOptions = struct {
-    /// AUR repository name (must be the package name, usually ending with `-bin`).
+    /// AUR package name (e.g. `takeoff` or `takeoff-bin`).
     aur_repo: []const u8,
     /// Optional SSH private key path to push to AUR.
     /// If null, `AUR_SSH_KEY` environment variable is used if present.
@@ -81,7 +81,6 @@ pub fn publishAurPackage(
     opts: AurPublishOptions,
 ) AurError!AurPublishResult {
     if (opts.aur_repo.len == 0) return error.InvalidConfig;
-    if (!std.mem.endsWith(u8, opts.aur_repo, "-bin")) return error.InvalidConfig;
 
     const artifact = try findLinuxX8664Tarball(allocator, io, opts.dist_dir, opts.project_name);
     defer {
@@ -154,18 +153,7 @@ pub fn publishAurPackage(
     const ssh_key = resolveSshKey(allocator, opts.aur_ssh_key) catch null;
     defer if (ssh_key) |k| allocator.free(k);
 
-    if (ssh_key == null) {
-        const msg = try allocator.dupe(u8, "generated PKGBUILD/.SRCINFO; AUR push skipped (no aur_ssh_key and no AUR_SSH_KEY)");
-        return .{
-            .success = true,
-            .pkgbuild_path = pkgbuild_path,
-            .srcinfo_path = srcinfo_path,
-            .pushed = false,
-            .message = msg,
-        };
-    }
-
-    const push_ok = pushToAur(allocator, io, opts.aur_repo, ssh_key.?, pkgbuild_path, srcinfo_path, pkgver) catch {
+    const push_ok = pushToAur(allocator, io, opts.aur_repo, ssh_key, pkgbuild_path, srcinfo_path, pkgver) catch {
         const msg = try allocator.dupe(u8, "generated PKGBUILD/.SRCINFO but failed to push to AUR");
         return .{
             .success = false,
@@ -380,7 +368,7 @@ fn pushToAur(
     allocator: std.mem.Allocator,
     io: std.Io,
     aur_repo: []const u8,
-    ssh_key: []const u8,
+    ssh_key: ?[]const u8,
     pkgbuild_path: []const u8,
     srcinfo_path: []const u8,
     pkgver: []const u8,
@@ -392,14 +380,16 @@ fn pushToAur(
     const repo_url = try std.fmt.allocPrint(allocator, "ssh://aur@aur.archlinux.org/{s}.git", .{aur_repo});
     defer allocator.free(repo_url);
 
-    const ssh_cmd = try std.fmt.allocPrint(allocator, "ssh -i \"{s}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", .{ssh_key});
-    defer allocator.free(ssh_cmd);
+    const ssh_cmd = if (ssh_key) |key|
+        try std.fmt.allocPrint(allocator, "ssh -i \"{s}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", .{key})
+    else
+        null;
+    defer if (ssh_cmd) |s| allocator.free(s);
 
-    const clone_cmd = try std.fmt.allocPrint(
-        allocator,
-        "GIT_SSH_COMMAND='{s}' git clone \"{s}\" \"{s}\"",
-        .{ ssh_cmd, repo_url, tmp_dir },
-    );
+    const clone_cmd = if (ssh_cmd) |s|
+        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git clone \"{s}\" \"{s}\"", .{ s, repo_url, tmp_dir })
+    else
+        try std.fmt.allocPrint(allocator, "git clone \"{s}\" \"{s}\"", .{ repo_url, tmp_dir });
     defer allocator.free(clone_cmd);
     try runShell(allocator, io, clone_cmd);
 
@@ -436,11 +426,10 @@ fn pushToAur(
     defer allocator.free(commit_cmd);
     try runShell(allocator, io, commit_cmd);
 
-    const push_cmd = try std.fmt.allocPrint(
-        allocator,
-        "GIT_SSH_COMMAND='{s}' git -C \"{s}\" push",
-        .{ ssh_cmd, tmp_dir },
-    );
+    const push_cmd = if (ssh_cmd) |s|
+        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git -C \"{s}\" push", .{ s, tmp_dir })
+    else
+        try std.fmt.allocPrint(allocator, "git -C \"{s}\" push", .{tmp_dir});
     defer allocator.free(push_cmd);
     try runShell(allocator, io, push_cmd);
 
@@ -496,7 +485,7 @@ test "normalizePkgver strips leading v and maps hyphen to underscore" {
 test "renderPkgbuild includes required install paths" {
     const allocator = std.testing.allocator;
     const md = AurMetadata{
-        .pkgname = "mytool-bin",
+        .pkgname = "mytool",
         .pkgver = "1.0.0",
         .pkgrel = "1",
         .pkgdesc = "My tool",
@@ -512,7 +501,7 @@ test "renderPkgbuild includes required install paths" {
     const content = try renderPkgbuild(allocator, md);
     defer allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname=mytool-bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname=mytool") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "install -Dm755") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/usr/share/man") != null);
     try std.testing.expect(std.mem.indexOf(u8, content, "/usr/share/bash-completion/completions") != null);
@@ -522,7 +511,7 @@ test "renderPkgbuild includes required install paths" {
 test "renderSrcinfo includes pkgbase and pkgname" {
     const allocator = std.testing.allocator;
     const md = AurMetadata{
-        .pkgname = "mytool-bin",
+        .pkgname = "mytool",
         .pkgver = "1.0.0",
         .pkgrel = "1",
         .pkgdesc = "My tool",
@@ -538,6 +527,6 @@ test "renderSrcinfo includes pkgbase and pkgname" {
     const content = try renderSrcinfo(allocator, md);
     defer allocator.free(content);
 
-    try std.testing.expect(std.mem.indexOf(u8, content, "pkgbase = mytool-bin") != null);
-    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname = mytool-bin") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "pkgbase = mytool") != null);
+    try std.testing.expect(std.mem.indexOf(u8, content, "pkgname = mytool") != null);
 }

@@ -22,7 +22,6 @@ pub const ValidationError = error{
     InvalidTargetArch,
     MissingGitHubOwner,
     MissingGitHubRepo,
-    MissingAurRepo,
 };
 
 pub const TemplateError = error{
@@ -157,8 +156,8 @@ pub const GitHubRelease = struct {
 
 /// Configuration for publishing to AUR.
 pub const AurRelease = struct {
-    /// AUR repository name (typically `<project>-bin`).
-    repo: []const u8,
+    /// AUR package name. Defaults to the project name if not specified.
+    repo: ?[]const u8 = null,
     /// Optional SSH private key path for pushing to AUR.
     /// If absent, environment variable `AUR_SSH_KEY` is used.
     aur_ssh_key: ?[]const u8 = null,
@@ -287,9 +286,13 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .draft = gh.draft,
             .prerelease = gh.prerelease,
         } else null;
-        const aur: ?AurRelease = if (rel.aur) |a| AurRelease{
-            .repo = try allocator.dupe(u8, a.repo),
-            .aur_ssh_key = try dupeOptStr(allocator, a.aur_ssh_key),
+        const aur_repo = if (rel.aur) |a| if (a.repo) |r|
+            try allocator.dupe(u8, r)
+        else
+            try allocator.dupe(u8, src.project.name) else null;
+        const aur: ?AurRelease = if (aur_repo) |ar| AurRelease{
+            .repo = ar,
+            .aur_ssh_key = try dupeOptStr(allocator, rel.aur.?.aur_ssh_key),
         } else null;
         break :blk Release{ .github = github, .aur = aur };
     } else null;
@@ -385,11 +388,7 @@ pub fn validate(config: *const Config) ValidationError!void {
                 return error.MissingGitHubRepo;
             }
         }
-        if (release.aur) |aur| {
-            if (aur.repo.len == 0) {
-                return error.MissingAurRepo;
-            }
-        }
+        // AUR repo defaults to project.name if not specified
     }
 }
 
@@ -493,7 +492,6 @@ pub fn formatValidationError(err: ValidationError, writer: anytype) !void {
         error.InvalidTargetArch => "invalid target arch (must be one of: x86_64, aarch64, arm, riscv64, x86)",
         error.MissingGitHubOwner => "missing required field: release.github.owner",
         error.MissingGitHubRepo => "missing required field: release.github.repo",
-        error.MissingAurRepo => "missing required field: release.aur.repo",
     };
     try writer.writeAll(msg);
 }
@@ -837,16 +835,38 @@ test "load parses packages.apk config" {
     try std.testing.expectEqualStrings("My Alpine package", a.description.?);
 }
 
-test "validate rejects empty release.aur.repo" {
-    const cfg = Config{
-        .project = .{ .name = "test" },
-        .targets = &[_]Target{.{ .os = "linux", .arch = "x86_64" }},
-        .release = .{ .aur = .{ .repo = "" } },
-    };
-    try std.testing.expectError(error.MissingAurRepo, validate(&cfg));
+test "aur repo defaults to project name when not specified" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const io = std.testing.io;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const json_content =
+        \\{
+        \\  "project": {"name": "mypkg"},
+        \\  "targets": [{"os": "linux", "arch": "x86_64"}],
+        \\  "release": {
+        \\    "aur": {}
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "test.json", .data = json_content });
+
+    var original_cwd = try std.Io.Dir.cwd().openDir(io, ".", .{});
+    defer original_cwd.close(io);
+    try std.process.setCurrentDir(io, tmp.dir);
+    defer std.process.setCurrentDir(io, original_cwd) catch {};
+
+    const cfg = try load(allocator, io, "test.json");
+    try std.testing.expect(cfg.release != null);
+    try std.testing.expect(cfg.release.?.aur != null);
+    try std.testing.expectEqualStrings("mypkg", cfg.release.?.aur.?.repo.?);
 }
 
-test "load parses release.aur config" {
+test "load parses release.aur config with explicit repo" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -877,7 +897,7 @@ test "load parses release.aur config" {
     const cfg = try load(allocator, io, "test.json");
     try std.testing.expect(cfg.release != null);
     try std.testing.expect(cfg.release.?.aur != null);
-    try std.testing.expectEqualStrings("mypkg-bin", cfg.release.?.aur.?.repo);
+    try std.testing.expectEqualStrings("mypkg-bin", cfg.release.?.aur.?.repo.?);
     try std.testing.expectEqualStrings("/home/user/.ssh/aur", cfg.release.?.aur.?.aur_ssh_key.?);
 }
 
