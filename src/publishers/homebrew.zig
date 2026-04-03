@@ -234,7 +234,12 @@ fn resolveSshKey(allocator: std.mem.Allocator, configured_key: ?[]const u8) !?[]
         return try allocator.dupe(u8, k);
     }
     const environ = std.Options.debug_threaded_io.?.environ.process_environ;
-    return std.process.Environ.getAlloc(environ, allocator, "HOMEBREW_TAP_SSH_KEY") catch null;
+    // Publisher-specific env var
+    if (std.process.Environ.getAlloc(environ, allocator, "HOMEBREW_TAP_SSH_KEY") catch null) |key| {
+        return key;
+    }
+    // Common fallback for all publishers
+    return std.process.Environ.getAlloc(environ, allocator, "TAKEOFF_SSH_KEY") catch null;
 }
 
 /// Clone the tap repo, write the formula, commit, and push.

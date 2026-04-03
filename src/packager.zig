@@ -24,6 +24,8 @@ pub const PackageResult = struct {
     rpm_path: ?[]const u8,
     /// Path to the generated `.apk` package, if one was produced.
     apk_path: ?[]const u8,
+    /// Path to the generated Scoop manifest JSON, if produced (set once, not per-target).
+    scoop_path: ?[]const u8,
     error_message: ?[]const u8,
 
     pub fn deinit(self: *PackageResult, allocator: std.mem.Allocator) void {
@@ -32,6 +34,7 @@ pub const PackageResult = struct {
         if (self.deb_path) |p| allocator.free(p);
         if (self.rpm_path) |p| allocator.free(p);
         if (self.apk_path) |p| allocator.free(p);
+        if (self.scoop_path) |p| allocator.free(p);
         if (self.error_message) |m| allocator.free(m);
     }
 };
@@ -66,6 +69,9 @@ pub const PackageSummary = struct {
                     try writer.print("   → {s}\n", .{path});
                 }
                 if (result.apk_path) |path| {
+                    try writer.print("   → {s}\n", .{path});
+                }
+                if (result.scoop_path) |path| {
                     try writer.print("   → {s}\n", .{path});
                 }
             } else {
@@ -156,6 +162,7 @@ fn packageTarget(
             .deb_path = null,
             .rpm_path = null,
             .apk_path = null,
+            .scoop_path = null,
             .error_message = error_msg,
         };
     };
@@ -202,6 +209,7 @@ fn packageTarget(
             .deb_path = null,
             .rpm_path = null,
             .apk_path = null,
+            .scoop_path = null,
             .error_message = error_copy,
         };
     }
@@ -263,6 +271,7 @@ fn packageTarget(
         .deb_path = deb_path_copy,
         .rpm_path = rpm_path_copy,
         .apk_path = apk_path_copy,
+        .scoop_path = null,
         .error_message = null,
     };
 }
@@ -412,6 +421,140 @@ fn packageTargetApk(
     return apk_output;
 }
 
+/// Generate a Scoop manifest JSON file.
+///
+/// This is called once after all targets are packaged, using the Windows zip
+/// archives to compute SHA-256 hashes. Returns the output path on success,
+/// or null if generation failed.
+pub fn generateScoopManifest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    version: []const u8,
+    output_dir: []const u8,
+    results: []const PackageResult,
+) !?[]const u8 {
+    const scoop_cfg = if (cfg.packages) |p| p.scoop else null;
+    if (scoop_cfg == null) return null;
+
+    // Find the Windows zip archives in the results
+    var url_64bit: ?[]const u8 = null;
+    var sha256_64bit: ?[]const u8 = null;
+    var url_arm64: ?[]const u8 = null;
+    var sha256_arm64: ?[]const u8 = null;
+
+    for (results) |result| {
+        if (!result.success) continue;
+        const archive_path = result.archive_path orelse continue;
+
+        // Determine architecture from the target string
+        const is_windows_x86_64 = std.mem.indexOf(u8, result.target, "windows-x86_64") != null;
+        const is_windows_arm64 = std.mem.indexOf(u8, result.target, "windows-aarch64") != null;
+
+        if (is_windows_x86_64) {
+            url_64bit = try buildDownloadUrl(allocator, cfg, version, archive_path);
+            sha256_64bit = try computeFileSha256(allocator, archive_path);
+        } else if (is_windows_arm64) {
+            url_arm64 = try buildDownloadUrl(allocator, cfg, version, archive_path);
+            sha256_arm64 = try computeFileSha256(allocator, archive_path);
+        }
+    }
+
+    // Need at least the 64-bit archive
+    if (url_64bit == null or sha256_64bit == null) return null;
+    defer {
+        if (url_64bit) |u| allocator.free(u);
+        if (sha256_64bit) |h| allocator.free(h);
+    }
+
+    // Determine binary name
+    const binary_name = try std.fmt.allocPrint(allocator, "{s}.exe", .{cfg.project.name});
+    defer allocator.free(binary_name);
+
+    // Determine homepage
+    const homepage = if (cfg.release) |rel|
+        if (rel.github) |gh|
+            try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh.owner, gh.repo })
+        else
+            null
+    else
+        null;
+    defer if (homepage) |h| allocator.free(h);
+
+    // Determine description and license
+    const description = cfg.project.description orelse cfg.project.name;
+    const license = cfg.project.license orelse "Unknown";
+
+    // Build output path: {output_dir}/bucket/{name}.json
+    const bucket_dir = try std.fs.path.join(allocator, &.{ output_dir, "bucket" });
+    defer allocator.free(bucket_dir);
+    const manifest_name = try std.fmt.allocPrint(allocator, "{s}.json", .{cfg.project.name});
+    defer allocator.free(manifest_name);
+    const output_path = try std.fs.path.join(allocator, &.{ bucket_dir, manifest_name });
+    defer allocator.free(output_path);
+
+    const scoop_gen_cfg = packagers.scoop.ScoopConfig{
+        .project_name = cfg.project.name,
+        .version = version,
+        .description = description,
+        .homepage = homepage orelse "",
+        .license = license,
+        .url_64bit = url_64bit.?,
+        .sha256_64bit = sha256_64bit.?,
+        .url_arm64 = url_arm64,
+        .sha256_arm64 = sha256_arm64,
+        .binary_name = binary_name,
+        .output_path = output_path,
+    };
+
+    packagers.scoop.generate(allocator, io, scoop_gen_cfg) catch |err| {
+        log.err("failed to generate Scoop manifest: {}", .{err});
+        return null;
+    };
+
+    log.info("generated Scoop manifest: {s}", .{output_path});
+    return try allocator.dupe(u8, output_path);
+}
+
+/// Build a GitHub release download URL from an archive path.
+fn buildDownloadUrl(
+    allocator: std.mem.Allocator,
+    cfg: config.Config,
+    version: []const u8,
+    archive_path: []const u8,
+) ![]const u8 {
+    const gh = if (cfg.release) |rel| rel.github else null;
+    if (gh == null) {
+        // Fallback: just the filename
+        return try allocator.dupe(u8, std.fs.path.basename(archive_path));
+    }
+    const filename = std.fs.path.basename(archive_path);
+    return try std.fmt.allocPrint(
+        allocator,
+        "https://github.com/{s}/{s}/releases/download/v{s}/{s}",
+        .{ gh.?.owner, gh.?.repo, version, filename },
+    );
+}
+
+/// Compute SHA-256 hash of a file.
+fn computeFileSha256(allocator: std.mem.Allocator, path: []const u8) ![]const u8 {
+    const content = try std.Io.Dir.cwd().readFileAlloc(
+        std.Options.debug_io,
+        path,
+        allocator,
+        .limited(512 * 1024 * 1024), // 512 MB max
+    );
+    defer allocator.free(content);
+
+    var hasher = std.crypto.hash.sha2.Sha256.init(.{});
+    hasher.update(content);
+
+    var hash: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
+    hasher.final(&hash);
+
+    return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(&hash, .lower)});
+}
+
 /// Context for parallel packaging workers.
 const PackageWorkerContext = struct {
     allocator: std.mem.Allocator,
@@ -477,6 +620,7 @@ pub fn generatePackages(
                 .deb_path = null,
                 .rpm_path = null,
                 .apk_path = null,
+                .scoop_path = null,
                 .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
             };
         }
@@ -514,6 +658,30 @@ pub fn generatePackages(
     }
 
     _ = group.await(io) catch {};
+
+    // Generate Scoop manifest (once, after all targets are packaged).
+    // This needs the Windows zip archives to exist so it can compute SHA-256.
+    const scoop_path = generateScoopManifest(
+        allocator,
+        io,
+        cfg,
+        version,
+        output_dir,
+        results,
+    ) catch |err| blk: {
+        log.err("failed to generate Scoop manifest: {}", .{err});
+        break :blk null;
+    };
+
+    // Attach scoop_path to the first successful result for tracking.
+    if (scoop_path) |sp| {
+        for (results) |*r| {
+            if (r.success) {
+                r.scoop_path = sp;
+                break;
+            }
+        }
+    }
 
     // Calculate summary
     var summary = PackageSummary{
@@ -637,6 +805,7 @@ fn packageWorker(
             .deb_path = null,
             .rpm_path = null,
             .apk_path = null,
+            .scoop_path = null,
             .error_message = if (error_msg_temp) |msg| allocator.dupe(u8, msg) catch null else null,
         };
         return;
@@ -648,6 +817,7 @@ fn packageWorker(
         if (result.deb_path) |path| temp_allocator.free(path);
         if (result.rpm_path) |path| temp_allocator.free(path);
         if (result.apk_path) |path| temp_allocator.free(path);
+        if (result.scoop_path) |path| temp_allocator.free(path);
         if (result.error_message) |msg| temp_allocator.free(msg);
     }
 
@@ -656,6 +826,7 @@ fn packageWorker(
     const copied_deb = if (result.deb_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_rpm = if (result.rpm_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_apk = if (result.apk_path) |path| allocator.dupe(u8, path) catch null else null;
+    const copied_scoop = if (result.scoop_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_error = if (result.error_message) |msg| allocator.dupe(u8, msg) catch null else null;
 
     context.allocator_mutex.lockUncancelable(context.io);
@@ -668,6 +839,7 @@ fn packageWorker(
         .deb_path = copied_deb,
         .rpm_path = copied_rpm,
         .apk_path = copied_apk,
+        .scoop_path = copied_scoop,
         .error_message = copied_error,
     };
 
@@ -742,6 +914,7 @@ test "PackageSummary calculates correctly" {
         .deb_path = null,
         .rpm_path = null,
         .apk_path = null,
+        .scoop_path = null,
         .error_message = null,
     };
 
@@ -752,6 +925,7 @@ test "PackageSummary calculates correctly" {
         .deb_path = null,
         .rpm_path = null,
         .apk_path = null,
+        .scoop_path = null,
         .error_message = try allocator.dupe(u8, "Build failed"),
     };
 
@@ -762,6 +936,7 @@ test "PackageSummary calculates correctly" {
         .deb_path = null,
         .rpm_path = null,
         .apk_path = null,
+        .scoop_path = null,
         .error_message = null,
     };
 
@@ -832,6 +1007,7 @@ test "packageWorkerLoop claims all indices with bounded workers" {
             .deb_path = null,
             .rpm_path = null,
             .apk_path = null,
+            .scoop_path = null,
             .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
         };
     }

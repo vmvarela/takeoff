@@ -400,10 +400,15 @@ fn generateSrcInfoFromPkgbuild(
 fn resolveSshKey(allocator: std.mem.Allocator, configured_key: ?[]const u8) !?[]const u8 {
     if (configured_key) |k| {
         if (k.len == 0) return null;
-        return @as(?[]const u8, try allocator.dupe(u8, k));
+        return try allocator.dupe(u8, k);
     }
     const environ = std.Options.debug_threaded_io.?.environ.process_environ;
-    return std.process.Environ.getAlloc(environ, allocator, "AUR_SSH_KEY") catch null;
+    // Publisher-specific env var
+    if (std.process.Environ.getAlloc(environ, allocator, "AUR_SSH_KEY") catch null) |key| {
+        return key;
+    }
+    // Common fallback for all publishers
+    return std.process.Environ.getAlloc(environ, allocator, "TAKEOFF_SSH_KEY") catch null;
 }
 
 fn pushToAur(

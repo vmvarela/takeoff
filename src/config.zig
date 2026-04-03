@@ -139,12 +139,30 @@ pub const HomebrewPackage = struct {
     }
 };
 
+/// Scoop bucket package configuration
+pub const ScoopPackage = struct {
+    /// Scoop bucket repository — "owner/bucket-repo"
+    bucket: ?[]const u8 = null,
+    /// Override the default description (falls back to project.description)
+    description: ?[]const u8 = null,
+    /// Override the default homepage (falls back to GitHub repo URL)
+    homepage: ?[]const u8 = null,
+    /// Bucket SSH key for pushing (falls back to SCOOP_BUCKET_SSH_KEY env, then TAKEOFF_SSH_KEY)
+    bucket_ssh_key: ?[]const u8 = null,
+
+    /// Returns the bucket name, or empty string if not configured.
+    pub fn getBucket(self: @This()) []const u8 {
+        return self.bucket orelse "";
+    }
+};
+
 pub const Packages = struct {
     tarball: ?TarballPackage = null,
     deb: ?DebPackage = null,
     rpm: ?RpmPackage = null,
     apk: ?ApkPackage = null,
     homebrew: ?HomebrewPackage = null,
+    scoop: ?ScoopPackage = null,
 };
 
 pub const GitHubRelease = struct {
@@ -278,7 +296,20 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .homepage = try dupeOptStr(allocator, hb.homepage),
             .tap_ssh_key = try dupeOptStr(allocator, hb.tap_ssh_key),
         } else null;
-        break :blk Packages{ .tarball = tarball, .deb = deb, .rpm = rpm, .apk = apk, .homebrew = homebrew };
+        const scoop: ?ScoopPackage = if (pkg.scoop) |sc| ScoopPackage{
+            .bucket = try dupeOptStr(allocator, sc.bucket),
+            .description = try dupeOptStr(allocator, sc.description),
+            .homepage = try dupeOptStr(allocator, sc.homepage),
+            .bucket_ssh_key = try dupeOptStr(allocator, sc.bucket_ssh_key),
+        } else null;
+        break :blk Packages{
+            .tarball = tarball,
+            .deb = deb,
+            .rpm = rpm,
+            .apk = apk,
+            .homebrew = homebrew,
+            .scoop = scoop,
+        };
     } else null;
 
     const release: ?Release = if (src.release) |rel| blk: {

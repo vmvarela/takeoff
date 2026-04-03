@@ -49,6 +49,11 @@
         "homebrew": {
             "tap": "vmvarela/homebrew-tap"
             // Optional: "tap_ssh_key": "/home/you/.ssh/homebrew-tap"
+        },
+        // Scoop manifest — shared bucket repo for all projects
+        "scoop": {
+            "bucket": "vmvarela/scoop-bucket"
+            // Optional: "bucket_ssh_key": "/home/you/.ssh/scoop-bucket"
         }
     },
 
