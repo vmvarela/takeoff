@@ -98,17 +98,19 @@ pub const PackageSummary = struct {
 };
 
 /// Determine the archive format based on target OS and config.
+///
+/// Windows always produces a `.zip` regardless of the configured tarball
+/// format, because Scoop and Winget require zip archives on Windows.
 fn determineFormat(target_os: []const u8, pkg_config: ?config.TarballPackage) archive.ArchiveFormat {
+    // Windows always uses zip — required by Scoop and Winget.
+    if (std.mem.eql(u8, target_os, "windows")) return .zip;
+
     if (pkg_config) |cfg| {
         const fmt = cfg.getFormat();
         if (std.mem.eql(u8, fmt, "zip")) return .zip;
         if (std.mem.eql(u8, fmt, "tar.gz")) return .tar_gz;
     }
 
-    // Default: tar.gz for Unix-like, zip for Windows
-    if (std.mem.eql(u8, target_os, "windows")) {
-        return .zip;
-    }
     return .tar_gz;
 }
 
@@ -141,7 +143,10 @@ fn packageTarget(
 
     // Determine format and extension
     const format = determineFormat(target.os, pkg_config);
-    const extension = if (pkg_config) |cfg| cfg.getExtension() else ".tar.gz";
+    const extension: []const u8 = switch (format) {
+        .zip => ".zip",
+        .tar_gz => ".tar.gz",
+    };
 
     // Build output path: {output_dir}/{name}-{version}-{os}-{arch}.{ext}
     const archive_name = try std.fmt.allocPrint(
@@ -641,7 +646,7 @@ fn buildDownloadUrl(
     const filename = std.fs.path.basename(archive_path);
     return try std.fmt.allocPrint(
         allocator,
-        "https://github.com/{s}/{s}/releases/download/v{s}/{s}",
+        "https://github.com/{s}/{s}/releases/download/{s}/{s}",
         .{ gh.?.owner, gh.?.repo, version, filename },
     );
 }
