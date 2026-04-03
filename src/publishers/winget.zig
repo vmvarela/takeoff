@@ -1,6 +1,7 @@
 //! Winget (Windows Package Manager) publisher — generates the three-file YAML
-//! manifest structure, clones the user's fork of `microsoft/winget-pkgs`,
-//! commits the files, pushes to the fork, and opens a PR via the GitHub API.
+//! manifest structure, then submits them to the user's fork of
+//! `microsoft/winget-pkgs` entirely via the GitHub Contents API (no git clone
+//! required) and opens a PR via the GitHub Pull-Request API.
 //!
 //! Directory structure in winget-pkgs:
 //!   manifests/{first-letter}/{publisher}/{name}/{version}/
@@ -9,7 +10,7 @@
 //!     {publisher}.{name}.installer.yaml
 
 const std = @import("std");
-const publishers = @import("github.zig");
+const github = @import("github.zig");
 
 const log = std.log.scoped(.winget_publish);
 
@@ -48,10 +49,7 @@ pub const WingetPublishOptions = struct {
     /// GitHub fork repo for pushing (e.g. "vmvarela/winget-pkgs").
     /// If null, the publisher auto-detects the fork via the GitHub API.
     fork_repo: ?[]const u8 = null,
-    /// Optional SSH private key for pushing to the fork.
-    /// Falls back to WINGET_FORK_SSH_KEY env var.
-    fork_ssh_key: ?[]const u8 = null,
-    /// GitHub token for API calls (PR creation, fork detection).
+    /// GitHub token for API calls (PR creation, fork detection, content upload).
     github_token: []const u8,
     /// If true, only generate and report — do not push or create PR.
     dry_run: bool = false,
@@ -119,18 +117,18 @@ pub fn publishWingetManifest(
             allocator.free(arm64_artifact.file_name);
             allocator.free(arm64_artifact.full_path);
         }
-        download_url_arm64 = try std.fmt.allocPrint(
+        const url = try std.fmt.allocPrint(
             allocator,
             "https://github.com/{s}/{s}/releases/download/{s}/{s}",
             .{ opts.owner, opts.repo, opts.tag, arm64_artifact.file_name },
         );
-        defer if (download_url_arm64) |u| allocator.free(u);
-
+        download_url_arm64 = url;
         sha256_arm64 = try computeSha256(allocator, arm64_artifact.full_path);
-        defer if (sha256_arm64) |h| allocator.free(h);
     } else |_| {
-        // arm64 is optional
+        // arm64 is optional — ignore the error
     }
+    defer if (download_url_arm64) |u| allocator.free(u);
+    defer if (sha256_arm64) |h| allocator.free(h);
 
     // Build output directory: {dist_dir}/winget/
     const winget_dir = try std.fs.path.join(allocator, &.{ opts.dist_dir, "winget" });
@@ -181,21 +179,26 @@ pub fn publishWingetManifest(
     };
     defer if (opts.fork_repo == null) allocator.free(fork_repo);
 
-    // Resolve SSH key
-    const ssh_key = resolveSshKey(allocator, opts.fork_ssh_key) catch null;
-    defer if (ssh_key) |k| allocator.free(k);
+    // Upload manifests via GitHub Contents API, then create PR
+    const package_id = try std.fmt.allocPrint(
+        allocator,
+        "{s}.{s}",
+        .{ opts.publisher, opts.project_name },
+    );
+    defer allocator.free(package_id);
 
-    // Clone the fork, commit, push, and create PR
-    const pr_url = try pushAndCreatePr(
+    const pr_url = try pushViaContentsApi(
         allocator,
         io,
+        opts.github_token,
         fork_repo,
-        ssh_key,
-        opts,
+        package_id,
+        opts.publisher,
+        opts.project_name,
         version,
         winget_dir,
-        opts.github_token,
     );
+    defer allocator.free(pr_url);
 
     if (pr_url.len > 0) {
         const msg = try std.fmt.allocPrint(
@@ -226,7 +229,7 @@ pub fn publishWingetManifest(
 }
 
 // ---------------------------------------------------------------------------
-// Fork detection via GitHub API (uses std.http, paginates)
+// Fork detection via GitHub API
 // ---------------------------------------------------------------------------
 
 /// Auto-detect the user's fork of microsoft/winget-pkgs via the GitHub API.
@@ -246,7 +249,7 @@ fn detectFork(
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var client = publishers.GitHubClient.initWithOptions(
+    var client = github.GitHubClient.initWithOptions(
         arena_alloc,
         io,
         token,
@@ -311,180 +314,213 @@ fn detectFork(
 }
 
 // ---------------------------------------------------------------------------
-// Git clone, commit, push, PR creation
+// GitHub Contents API: create branch + upload files + create PR
 // ---------------------------------------------------------------------------
 
-/// Clone the fork, write manifests, commit, push, and create a PR.
-fn pushAndCreatePr(
+/// Push the three manifest files to the fork via the GitHub Contents API
+/// (no git clone) and open a PR to microsoft/winget-pkgs.
+///
+/// Returns the PR URL (caller must free), or an empty string (also allocated,
+/// caller must free) when there are no changes to submit.
+fn pushViaContentsApi(
     allocator: std.mem.Allocator,
     io: std.Io,
+    token: []const u8,
     fork_repo: []const u8,
-    ssh_key: ?[]const u8,
-    opts: WingetPublishOptions,
+    package_id: []const u8,
+    publisher: []const u8,
+    project_name: []const u8,
     version: []const u8,
     winget_dir: []const u8,
-    github_token: []const u8,
 ) WingetPublishError![]const u8 {
-    const package_id = try std.fmt.allocPrint(
-        allocator,
-        "{s}.{s}",
-        .{ opts.publisher, opts.project_name },
-    );
-    defer allocator.free(package_id);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
 
-    // Target path in winget-pkgs: manifests/{first-letter}/{publisher}/{name}/{version}/
-    const first_letter_upper = try std.fmt.allocPrint(
-        allocator,
-        "{c}",
-        .{std.ascii.toUpper(opts.publisher[0])},
-    );
-    defer allocator.free(first_letter_upper);
+    var client = github.GitHubClient.initWithOptions(
+        a,
+        io,
+        token,
+        .{ .timeout_ms = 60_000 },
+    ) catch return error.NetworkError;
+    defer client.deinit();
 
-    const manifests_path = try std.fs.path.join(
-        allocator,
-        &.{ "manifests", first_letter_upper, opts.publisher, opts.project_name, version },
-    );
-    defer allocator.free(manifests_path);
+    // Step 1: Get the fork's default branch and its SHA
+    const repo_path = try std.fmt.allocPrint(a, "/repos/{s}", .{fork_repo});
+    const repo_resp = client.makeRequest(.GET, repo_path, null) catch return error.NetworkError;
+    defer client.allocator.free(repo_resp);
 
-    // Temp directory — include a random suffix to avoid collisions
-    var rand_buf: [8]u8 = undefined;
-    std.Io.random(io, &rand_buf);
-    const tmp_dir = try std.fmt.allocPrint(
-        allocator,
-        "/tmp/takeoff-winget-{s}-{s}-{s}",
-        .{ std.fs.path.basename(fork_repo), version, std.fmt.bytesToHex(rand_buf, .lower) },
-    );
-    defer allocator.free(tmp_dir);
-    std.Io.Dir.cwd().createDirPath(io, tmp_dir) catch return error.WriteError;
+    const repo_val = std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        repo_resp,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.NetworkError;
 
-    // SSH command
-    const ssh_cmd = if (ssh_key) |key|
-        try std.fmt.allocPrint(allocator, "ssh -i \"{s}\" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new", .{key})
+    const default_branch = if (repo_val.value == .object)
+        if (repo_val.value.object.get("default_branch")) |v|
+            if (v == .string) v.string else "master"
+        else
+            "master"
     else
-        null;
-    defer if (ssh_cmd) |s| allocator.free(s);
+        "master";
 
-    // Clone fork
-    const clone_url = try buildCloneUrl(allocator, fork_repo);
-    defer allocator.free(clone_url);
+    // GET /repos/{fork}/branches/{default_branch} to obtain the HEAD SHA
+    const branch_path = try std.fmt.allocPrint(a, "/repos/{s}/branches/{s}", .{ fork_repo, default_branch });
+    const branch_resp = client.makeRequest(.GET, branch_path, null) catch return error.NetworkError;
+    defer client.allocator.free(branch_resp);
 
-    const clone_cmd = if (ssh_cmd) |s|
-        try std.fmt.allocPrint(allocator, "GIT_SSH_COMMAND='{s}' git clone --depth=1 \"{s}\" \"{s}\"", .{ s, clone_url, tmp_dir })
+    const branch_val = std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        branch_resp,
+        .{ .ignore_unknown_fields = true },
+    ) catch return error.NetworkError;
+
+    const base_sha: []const u8 = if (branch_val.value == .object)
+        if (branch_val.value.object.get("commit")) |c|
+            if (c == .object)
+                if (c.object.get("sha")) |s|
+                    if (s == .string) s.string else return error.NetworkError
+                else
+                    return error.NetworkError
+            else
+                return error.NetworkError
+        else
+            return error.NetworkError
     else
-        try std.fmt.allocPrint(allocator, "git clone --depth=1 \"{s}\" \"{s}\"", .{ clone_url, tmp_dir });
-    defer allocator.free(clone_cmd);
-    try runShell(allocator, io, clone_cmd);
+        return error.NetworkError;
 
-    // Create target directory
-    const target_dir = try std.fs.path.join(allocator, &.{ tmp_dir, manifests_path });
-    defer allocator.free(target_dir);
-    std.Io.Dir.cwd().createDirPath(io, target_dir) catch return error.WriteError;
+    // Step 2: Create a new branch in the fork
+    const branch_name = try std.fmt.allocPrint(a, "takeoff-{s}-{s}", .{ project_name, version });
+    const new_ref = try std.fmt.allocPrint(a, "refs/heads/{s}", .{branch_name});
+    const create_ref_path = try std.fmt.allocPrint(a, "/repos/{s}/git/refs", .{fork_repo});
+    const create_ref_body = try std.fmt.allocPrint(
+        a,
+        "{{\"ref\":\"{s}\",\"sha\":\"{s}\"}}",
+        .{ new_ref, base_sha },
+    );
 
-    // Copy the three YAML files
-    const files = [_][]const u8{
-        try std.fmt.allocPrint(allocator, "{s}.yaml", .{package_id}),
-        try std.fmt.allocPrint(allocator, "{s}.locale.en-US.yaml", .{package_id}),
-        try std.fmt.allocPrint(allocator, "{s}.installer.yaml", .{package_id}),
+    // 422 (AlreadyExists) means the branch already exists — that's fine, we'll
+    // just overwrite the files on it.
+    _ = client.makeRequest(.POST, create_ref_path, create_ref_body) catch |err| switch (err) {
+        error.AlreadyExists => {
+            log.info("branch {s} already exists in fork — will reuse it", .{branch_name});
+        },
+        else => {
+            log.err("failed to create branch {s}: {}", .{ branch_name, err });
+            return error.PushFailed;
+        },
     };
-    defer {
-        for (files) |f| allocator.free(f);
-    }
 
-    for (files) |filename| {
-        const src = try std.fs.path.join(allocator, &.{ winget_dir, filename });
-        defer allocator.free(src);
-        const dst = try std.fs.path.join(allocator, &.{ target_dir, filename });
-        defer allocator.free(dst);
+    // Step 3: Upload each manifest file via PUT /repos/{fork}/contents/{path}
+    const first_letter_upper = try std.fmt.allocPrint(a, "{c}", .{std.ascii.toUpper(publisher[0])});
+    const manifests_base = try std.fmt.allocPrint(
+        a,
+        "manifests/{s}/{s}/{s}/{s}",
+        .{ first_letter_upper, publisher, project_name, version },
+    );
 
-        const content = std.Io.Dir.cwd().readFileAlloc(
+    const file_names = [_][]const u8{
+        try std.fmt.allocPrint(a, "{s}.yaml", .{package_id}),
+        try std.fmt.allocPrint(a, "{s}.locale.en-US.yaml", .{package_id}),
+        try std.fmt.allocPrint(a, "{s}.installer.yaml", .{package_id}),
+    };
+
+    var any_change = false;
+
+    for (file_names) |filename| {
+        const local_path = try std.fs.path.join(a, &.{ winget_dir, filename });
+        const content_raw = std.Io.Dir.cwd().readFileAlloc(
             std.Options.debug_io,
-            src,
-            allocator,
+            local_path,
+            a,
             .limited(64 * 1024),
         ) catch return error.ReadError;
-        defer allocator.free(content);
 
-        writeFile(io, dst, content) catch return error.WriteError;
+        // Base64-encode the file content for the GitHub Contents API
+        const b64_len = std.base64.standard.Encoder.calcSize(content_raw.len);
+        const b64_buf = try a.alloc(u8, b64_len);
+        _ = std.base64.standard.Encoder.encode(b64_buf, content_raw);
+
+        const repo_file_path = try std.fmt.allocPrint(
+            a,
+            "{s}/{s}",
+            .{ manifests_base, filename },
+        );
+        const contents_api_path = try std.fmt.allocPrint(
+            a,
+            "/repos/{s}/contents/{s}",
+            .{ fork_repo, repo_file_path },
+        );
+
+        // Check if the file already exists (to get its SHA for updates)
+        var existing_sha: ?[]const u8 = null;
+        if (client.makeRequest(.GET, contents_api_path, null)) |resp| {
+            defer client.allocator.free(resp);
+            const val = std.json.parseFromSlice(
+                std.json.Value,
+                a,
+                resp,
+                .{ .ignore_unknown_fields = true },
+            ) catch null;
+            if (val) |v| {
+                if (v.value == .object) {
+                    if (v.value.object.get("sha")) |s| {
+                        if (s == .string) existing_sha = s.string;
+                    }
+                }
+            }
+        } else |_| {
+            // File doesn't exist yet — that's fine
+        }
+
+        // Build JSON body for PUT /contents
+        const commit_msg = try std.fmt.allocPrint(
+            a,
+            "New version: {s} {s}",
+            .{ package_id, version },
+        );
+        const escaped_msg = try escapeJsonValue(a, commit_msg);
+        const escaped_b64 = try escapeJsonValue(a, b64_buf);
+        const escaped_branch = try escapeJsonValue(a, branch_name);
+
+        const put_body = if (existing_sha) |sha|
+            try std.fmt.allocPrint(
+                a,
+                "{{\"message\":\"{s}\",\"content\":\"{s}\",\"branch\":\"{s}\",\"sha\":\"{s}\"}}",
+                .{ escaped_msg, escaped_b64, escaped_branch, sha },
+            )
+        else
+            try std.fmt.allocPrint(
+                a,
+                "{{\"message\":\"{s}\",\"content\":\"{s}\",\"branch\":\"{s}\"}}",
+                .{ escaped_msg, escaped_b64, escaped_branch },
+            );
+
+        _ = client.makeRequest(.PUT, contents_api_path, put_body) catch |err| {
+            log.err("failed to upload {s}: {}", .{ filename, err });
+            return error.PushFailed;
+        };
+
+        log.info("uploaded manifest file: {s}", .{filename});
+        any_change = true;
     }
 
-    // git add
-    const add_cmd = try std.fmt.allocPrint(
-        allocator,
-        "git -C \"{s}\" add \"{s}/\"",
-        .{ tmp_dir, manifests_path },
-    );
-    defer allocator.free(add_cmd);
-    try runShell(allocator, io, add_cmd);
+    if (!any_change) {
+        return try allocator.dupe(u8, "");
+    }
 
-    // Check if there are changes
-    const status_cmd = try std.fmt.allocPrint(
-        allocator,
-        "git -C \"{s}\" status --porcelain -- \"{s}/\"",
-        .{ tmp_dir, manifests_path },
-    );
-    defer allocator.free(status_cmd);
-    const changed = try runShellReturnsChanged(allocator, io, status_cmd);
-    if (!changed) return try allocator.dupe(u8, "");
-
-    // Create a branch
-    const branch_name = try std.fmt.allocPrint(
-        allocator,
-        "takeoff-{s}-{s}",
-        .{ opts.project_name, version },
-    );
-    defer allocator.free(branch_name);
-
-    const branch_cmd = try std.fmt.allocPrint(
-        allocator,
-        "git -C \"{s}\" checkout -b \"{s}\"",
-        .{ tmp_dir, branch_name },
-    );
-    defer allocator.free(branch_cmd);
-    try runShell(allocator, io, branch_cmd);
-
-    // Commit
-    const commit_msg = try std.fmt.allocPrint(
-        allocator,
-        "New version: {s} v{s}",
-        .{ package_id, version },
-    );
-    defer allocator.free(commit_msg);
-
-    const commit_cmd = try std.fmt.allocPrint(
-        allocator,
-        "git -C \"{s}\" commit -m \"{s}\"",
-        .{ tmp_dir, commit_msg },
-    );
-    defer allocator.free(commit_cmd);
-    try runShell(allocator, io, commit_cmd);
-
-    // Push branch to fork
-    const push_cmd = if (ssh_cmd) |s|
-        try std.fmt.allocPrint(
-            allocator,
-            "GIT_SSH_COMMAND='{s}' git -C \"{s}\" push origin \"{s}\"",
-            .{ s, tmp_dir, branch_name },
-        )
-    else
-        try std.fmt.allocPrint(
-            allocator,
-            "git -C \"{s}\" push origin \"{s}\"",
-            .{ tmp_dir, branch_name },
-        );
-    defer allocator.free(push_cmd);
-    try runShell(allocator, io, push_cmd);
-
-    // Create PR via GitHub API
+    // Step 4: Create the PR
     const pr_url = try createPr(
         allocator,
         io,
-        github_token,
+        token,
         fork_repo,
         branch_name,
         package_id,
         version,
     );
-
     return pr_url;
 }
 
@@ -513,7 +549,7 @@ fn createPr(
 
     const title = try std.fmt.allocPrint(
         allocator,
-        "New version: {s} v{s}",
+        "New version: {s} {s}",
         .{ package_id, version },
     );
     defer allocator.free(title);
@@ -532,41 +568,29 @@ fn createPr(
     defer allocator.free(body_text);
 
     // Build JSON body manually using allocPrint
-    var json_parts: std.ArrayList([]const u8) = .empty;
-    defer {
-        for (json_parts.items) |p| allocator.free(p);
-        json_parts.deinit(allocator);
-    }
-
-    try json_parts.append(allocator, try std.fmt.allocPrint(allocator, "{{\"title\":\"", .{}));
-    try json_parts.append(allocator, try escapeJsonValue(allocator, title));
-    try json_parts.append(allocator, try std.fmt.allocPrint(allocator, "\",\"body\":\"", .{}));
-    try json_parts.append(allocator, try escapeJsonValue(allocator, body_text));
-    try json_parts.append(allocator, try std.fmt.allocPrint(allocator, "\",\"head\":\"", .{}));
-    try json_parts.append(allocator, try escapeJsonValue(allocator, head));
-    try json_parts.append(allocator, try std.fmt.allocPrint(allocator, "\",\"base\":\"master\"}}", .{}));
-
-    // Join all parts
-    var json_body: std.ArrayList(u8) = .empty;
-    defer json_body.deinit(allocator);
-    for (json_parts.items) |part| {
-        try json_body.appendSlice(allocator, part);
-    }
-
-    // Use std.http via GitHubClient
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
-    const arena_alloc = arena.allocator();
+    const a = arena.allocator();
 
-    var client = publishers.GitHubClient.initWithOptions(
-        arena_alloc,
+    const escaped_title = try escapeJsonValue(a, title);
+    const escaped_body = try escapeJsonValue(a, body_text);
+    const escaped_head = try escapeJsonValue(a, head);
+
+    const json_body = try std.fmt.allocPrint(
+        a,
+        "{{\"title\":\"{s}\",\"body\":\"{s}\",\"head\":\"{s}\",\"base\":\"master\"}}",
+        .{ escaped_title, escaped_body, escaped_head },
+    );
+
+    var client = github.GitHubClient.initWithOptions(
+        a,
         io,
         token,
         .{ .timeout_ms = 30_000 },
     ) catch return error.NetworkError;
     defer client.deinit();
 
-    const response = client.makeRequest(.POST, "/repos/microsoft/winget-pkgs/pulls", json_body.items) catch |err| {
+    const response = client.makeRequest(.POST, "/repos/microsoft/winget-pkgs/pulls", json_body) catch |err| {
         log.err("PR creation failed: {}", .{err});
         return error.PrFailed;
     };
@@ -575,13 +599,16 @@ fn createPr(
     // Parse PR URL from response
     const parsed = std.json.parseFromSlice(
         std.json.Value,
-        arena_alloc,
+        a,
         response,
         .{ .ignore_unknown_fields = true },
     ) catch return error.PrFailed;
 
-    const html_url = if (parsed.value.object.get("html_url")) |v|
-        if (v == .string) v.string else ""
+    const html_url = if (parsed.value == .object)
+        if (parsed.value.object.get("html_url")) |v|
+            if (v == .string) v.string else ""
+        else
+            ""
     else
         "";
 
@@ -594,10 +621,9 @@ fn createPr(
 // JSON helpers
 // ---------------------------------------------------------------------------
 
-/// Escape a string value for safe embedding in a JSON string.
+/// Escape a string value for safe embedding in a JSON string literal.
 /// Returns an allocated string that the caller must free.
 fn escapeJsonValue(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
-    // Worst case: every char needs escaping (2 bytes each)
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
@@ -615,7 +641,7 @@ fn escapeJsonValue(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers (mirrored from scoop.zig)
+// Helpers
 // ---------------------------------------------------------------------------
 
 /// Find a Windows zip artifact for a specific architecture.
@@ -681,86 +707,9 @@ fn computeSha256(allocator: std.mem.Allocator, path: []const u8) WingetPublishEr
     return try std.fmt.allocPrint(allocator, "{s}", .{std.fmt.bytesToHex(&hash, .lower)});
 }
 
-/// Build the SSH clone URL for the fork repo.
-fn buildCloneUrl(
-    allocator: std.mem.Allocator,
-    fork_repo: []const u8,
-) WingetPublishError![]const u8 {
-    const slash = std.mem.indexOfScalar(u8, fork_repo, '/') orelse {
-        return try std.fmt.allocPrint(allocator, "git@github.com:{s}/{s}.git", .{ fork_repo, fork_repo });
-    };
-    const owner = fork_repo[0..slash];
-    const repo = fork_repo[slash + 1 ..];
-    return try std.fmt.allocPrint(allocator, "git@github.com:{s}/{s}.git", .{ owner, repo });
-}
-
-/// Resolve the SSH key from config or environment.
-fn resolveSshKey(allocator: std.mem.Allocator, configured_key: ?[]const u8) !?[]const u8 {
-    if (configured_key) |k| {
-        if (k.len == 0) return null;
-        return try allocator.dupe(u8, k);
-    }
-    const environ = std.Options.debug_threaded_io.?.environ.process_environ;
-    if (std.process.Environ.getAlloc(environ, allocator, "WINGET_FORK_SSH_KEY") catch null) |key| {
-        return key;
-    }
-    return std.process.Environ.getAlloc(environ, allocator, "TAKEOFF_SSH_KEY") catch null;
-}
-
-fn runShell(allocator: std.mem.Allocator, io: std.Io, command: []const u8) WingetPublishError!void {
-    const run = std.process.run(std.heap.page_allocator, io, .{
-        .argv = &.{ "sh", "-c", command },
-        .stdout_limit = .limited(1024 * 1024),
-        .stderr_limit = .limited(1024 * 1024),
-    }) catch return error.ProcessError;
-    defer {
-        std.heap.page_allocator.free(run.stdout);
-        std.heap.page_allocator.free(run.stderr);
-    }
-    if (run.term != .exited or run.term.exited != 0) {
-        if (run.stderr.len > 0) log.err("command failed: {s}\n{s}", .{ command, run.stderr });
-        return error.PushFailed;
-    }
-    _ = allocator;
-}
-
-fn runShellReturnsChanged(allocator: std.mem.Allocator, io: std.Io, command: []const u8) WingetPublishError!bool {
-    const run = std.process.run(std.heap.page_allocator, io, .{
-        .argv = &.{ "sh", "-c", command },
-        .stdout_limit = .limited(64 * 1024),
-        .stderr_limit = .limited(64 * 1024),
-    }) catch return error.ProcessError;
-    defer {
-        std.heap.page_allocator.free(run.stdout);
-        std.heap.page_allocator.free(run.stderr);
-    }
-    _ = allocator;
-    return run.stdout.len > 0;
-}
-
-fn writeFile(io: std.Io, path: []const u8, content: []const u8) WingetPublishError!void {
-    const f = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch return error.WriteError;
-    defer f.close(io);
-    f.writeStreamingAll(io, content) catch return error.WriteError;
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
-
-test "buildCloneUrl parses owner/repo" {
-    const allocator = std.testing.allocator;
-    const url = try buildCloneUrl(allocator, "vmvarela/winget-pkgs");
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings("git@github.com:vmvarela/winget-pkgs.git", url);
-}
-
-test "buildCloneUrl handles bare repo name" {
-    const allocator = std.testing.allocator;
-    const url = try buildCloneUrl(allocator, "winget-pkgs");
-    defer allocator.free(url);
-    try std.testing.expectEqualStrings("git@github.com:winget-pkgs/winget-pkgs.git", url);
-}
 
 test "escapeJsonValue escapes special characters" {
     const allocator = std.testing.allocator;
@@ -770,12 +719,28 @@ test "escapeJsonValue escapes special characters" {
     try std.testing.expectEqualStrings("hello \\\"world\\\"\\n", result);
 }
 
-test "escapeJsonValue produces valid JSON for PR body" {
+test "escapeJsonValue passes plain strings unchanged" {
     const allocator = std.testing.allocator;
 
     const result = try escapeJsonValue(allocator, "Test v1.0");
     defer allocator.free(result);
     try std.testing.expectEqualStrings("Test v1.0", result);
+}
+
+test "escapeJsonValue escapes backslash" {
+    const allocator = std.testing.allocator;
+
+    const result = try escapeJsonValue(allocator, "path\\to\\file");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("path\\\\to\\\\file", result);
+}
+
+test "escapeJsonValue escapes tab and carriage return" {
+    const allocator = std.testing.allocator;
+
+    const result = try escapeJsonValue(allocator, "a\tb\rc");
+    defer allocator.free(result);
+    try std.testing.expectEqualStrings("a\\tb\\rc", result);
 }
 
 test "computeSha256 produces lowercase hex" {
@@ -794,4 +759,20 @@ test "computeSha256 produces lowercase hex" {
 
     // SHA-256 of "hello" is 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
     try std.testing.expectEqualStrings("2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", hash);
+}
+
+test "base64 encoding of manifest content is non-empty" {
+    // Verify the base64 encoding logic produces correctly-sized output
+    const content = "PackageIdentifier: foo.bar\nManifestType: version\n";
+    const b64_len = std.base64.standard.Encoder.calcSize(content.len);
+    try std.testing.expect(b64_len > content.len);
+
+    const buf = try std.testing.allocator.alloc(u8, b64_len);
+    defer std.testing.allocator.free(buf);
+    const result = std.base64.standard.Encoder.encode(buf, content);
+    try std.testing.expect(result.len > 0);
+    // Base64 alphabet must only contain valid chars (A-Z a-z 0-9 + / =)
+    for (result) |c| {
+        try std.testing.expect(std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '=');
+    }
 }
