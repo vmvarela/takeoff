@@ -28,6 +28,8 @@ pub const PackageResult = struct {
     scoop_path: ?[]const u8,
     /// Path to the generated Winget manifest directory, if produced (set once, not per-target).
     winget_path: ?[]const u8,
+    /// Path to the generated Chocolatey .nupkg package, if produced (set once, not per-target).
+    chocolatey_path: ?[]const u8,
     error_message: ?[]const u8,
 
     pub fn deinit(self: *PackageResult, allocator: std.mem.Allocator) void {
@@ -38,6 +40,7 @@ pub const PackageResult = struct {
         if (self.apk_path) |p| allocator.free(p);
         if (self.scoop_path) |p| allocator.free(p);
         if (self.winget_path) |p| allocator.free(p);
+        if (self.chocolatey_path) |p| allocator.free(p);
         if (self.error_message) |m| allocator.free(m);
     }
 };
@@ -78,6 +81,9 @@ pub const PackageSummary = struct {
                     try writer.print("   → {s}\n", .{path});
                 }
                 if (result.winget_path) |path| {
+                    try writer.print("   → {s}\n", .{path});
+                }
+                if (result.chocolatey_path) |path| {
                     try writer.print("   → {s}\n", .{path});
                 }
             } else {
@@ -175,6 +181,7 @@ fn packageTarget(
             .apk_path = null,
             .scoop_path = null,
             .winget_path = null,
+            .chocolatey_path = null,
             .error_message = error_msg,
         };
     };
@@ -223,6 +230,7 @@ fn packageTarget(
             .apk_path = null,
             .scoop_path = null,
             .winget_path = null,
+            .chocolatey_path = null,
             .error_message = error_copy,
         };
     }
@@ -286,6 +294,7 @@ fn packageTarget(
         .apk_path = apk_path_copy,
         .scoop_path = null,
         .winget_path = null,
+        .chocolatey_path = null,
         .error_message = null,
     };
 }
@@ -631,6 +640,167 @@ pub fn generateWingetManifest(
     return try allocator.dupe(u8, winget_dir);
 }
 
+/// Generate a Chocolatey `.nupkg` package.
+///
+/// This is called once after all targets are packaged, using the Windows zip
+/// archives to compute SHA-256 hashes. Returns the output path on success,
+/// or null if generation failed or chocolatey is not configured.
+pub fn generateChocolateyManifest(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: config.Config,
+    version: []const u8,
+    output_dir: []const u8,
+    results: []const PackageResult,
+) !?[]const u8 {
+    const choco_cfg = if (cfg.packages) |p| p.chocolatey else null;
+    if (choco_cfg == null) return null;
+
+    // Chocolatey/NuGet package versions must not include a leading 'v'.
+    const chocolatey_version = if (std.mem.startsWith(u8, version, "v")) version[1..] else version;
+
+    // Find the Windows zip archives in the results
+    var url_x64: ?[]const u8 = null;
+    var sha256_x64: ?[]const u8 = null;
+    var url_arm64: ?[]const u8 = null;
+    var sha256_arm64: ?[]const u8 = null;
+
+    for (results) |result| {
+        if (!result.success) continue;
+        const archive_path = result.archive_path orelse continue;
+
+        const is_windows_x86_64 = std.mem.indexOf(u8, result.target, "windows-x86_64") != null;
+        const is_windows_arm64 = std.mem.indexOf(u8, result.target, "windows-aarch64") != null;
+
+        if (is_windows_x86_64) {
+            url_x64 = try buildDownloadUrl(allocator, cfg, version, archive_path);
+            sha256_x64 = try computeFileSha256(allocator, archive_path);
+        } else if (is_windows_arm64) {
+            url_arm64 = try buildDownloadUrl(allocator, cfg, version, archive_path);
+            sha256_arm64 = try computeFileSha256(allocator, archive_path);
+        }
+    }
+
+    // Need at least the x64 archive
+    if (url_x64 == null or sha256_x64 == null) return null;
+    defer {
+        if (url_x64) |u| allocator.free(u);
+        if (sha256_x64) |h| allocator.free(h);
+    }
+
+    // Determine title (must differ from package_id — CPMR0050)
+    const title = try std.fmt.allocPrint(allocator, "{s} (Portable)", .{cfg.project.name});
+    defer allocator.free(title);
+
+    // Determine authors — fallback to GitHub owner
+    const authors = if (choco_cfg.?.authors) |a| a else if (cfg.release) |rel|
+        if (rel.github) |gh| gh.owner else cfg.project.name
+    else
+        cfg.project.name;
+
+    // Determine homepage
+    const homepage = if (choco_cfg.?.homepage) |h| h else if (cfg.release) |rel|
+        if (rel.github) |gh|
+            try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh.owner, gh.repo })
+        else
+            null
+    else
+        null;
+    defer if (homepage) |h| allocator.free(h);
+
+    // Determine description
+    const description = choco_cfg.?.description orelse cfg.project.description orelse cfg.project.name;
+
+    // Determine tags
+    const tags = if (choco_cfg.?.tags) |t| t else blk: {
+        const default_tags = try std.fmt.allocPrint(allocator, "{s} portable cli", .{cfg.project.name});
+        break :blk default_tags;
+    };
+    defer if (choco_cfg.?.tags == null) allocator.free(tags);
+
+    // Determine package source URL
+    const package_source_url = if (choco_cfg.?.package_source_url) |u| u else if (cfg.release) |rel|
+        if (rel.github) |gh|
+            try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}", .{ gh.owner, gh.repo })
+        else
+            null
+    else
+        null;
+    defer if (package_source_url) |u| allocator.free(u);
+
+    // Build license and release notes URLs
+    const license_url = if (cfg.release) |rel|
+        if (rel.github) |gh|
+            try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}/blob/main/LICENSE", .{ gh.owner, gh.repo })
+        else
+            null
+    else
+        null;
+    defer if (license_url) |u| allocator.free(u);
+
+    const release_notes_url = if (cfg.release) |rel|
+        if (rel.github) |gh|
+            try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}/releases", .{ gh.owner, gh.repo })
+        else
+            null
+    else
+        null;
+    defer if (release_notes_url) |u| allocator.free(u);
+
+    const bug_tracker_url = if (cfg.release) |rel|
+        if (rel.github) |gh|
+            try std.fmt.allocPrint(allocator, "https://github.com/{s}/{s}/issues", .{ gh.owner, gh.repo })
+        else
+            null
+    else
+        null;
+    defer if (bug_tracker_url) |u| allocator.free(u);
+
+    // Binary name
+    const binary_name = try std.fmt.allocPrint(allocator, "{s}.exe", .{cfg.project.name});
+    defer allocator.free(binary_name);
+
+    // Build output path: {output_dir}/chocolatey/{package_id}.{version}.nupkg
+    const choco_dir = try std.fs.path.join(allocator, &.{ output_dir, "chocolatey" });
+    defer allocator.free(choco_dir);
+    std.Io.Dir.cwd().createDirPath(io, choco_dir) catch {};
+    const nupkg_name = try std.fmt.allocPrint(allocator, "{s}.{s}.nupkg", .{ cfg.project.name, chocolatey_version });
+    defer allocator.free(nupkg_name);
+    const output_path = try std.fs.path.join(allocator, &.{ choco_dir, nupkg_name });
+    defer allocator.free(output_path);
+
+    const gen_cfg = packagers.chocolatey.ChocolateyConfig{
+        .package_id = cfg.project.name,
+        .version = chocolatey_version,
+        .title = title,
+        .authors = authors,
+        .summary = description,
+        .description = description,
+        .project_url = homepage orelse "",
+        .license_url = license_url orelse "",
+        .project_source_url = homepage orelse "",
+        .bug_tracker_url = bug_tracker_url orelse "",
+        .package_source_url = package_source_url orelse "",
+        .tags = tags,
+        .release_notes = release_notes_url orelse "",
+        .icon_url = choco_cfg.?.icon_url,
+        .url_x64 = url_x64.?,
+        .sha256_x64 = sha256_x64.?,
+        .url_arm64 = url_arm64,
+        .sha256_arm64 = sha256_arm64,
+        .binary_name = binary_name,
+        .output_path = output_path,
+    };
+
+    packagers.chocolatey.generate(allocator, io, gen_cfg) catch |err| {
+        log.err("failed to generate Chocolatey package: {}", .{err});
+        return null;
+    };
+
+    log.info("generated Chocolatey package: {s}", .{output_path});
+    return try allocator.dupe(u8, output_path);
+}
+
 /// Build a GitHub release download URL from an archive path.
 fn buildDownloadUrl(
     allocator: std.mem.Allocator,
@@ -737,6 +907,7 @@ pub fn generatePackages(
                 .apk_path = null,
                 .scoop_path = null,
                 .winget_path = null,
+                .chocolatey_path = null,
                 .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
             };
         }
@@ -818,6 +989,30 @@ pub fn generatePackages(
         for (results) |*r| {
             if (r.success) {
                 r.winget_path = wp;
+                break;
+            }
+        }
+    }
+
+    // Generate Chocolatey package (once, after all targets are packaged).
+    // This needs the Windows zip archives to exist so it can compute SHA-256.
+    const chocolatey_path = generateChocolateyManifest(
+        allocator,
+        io,
+        cfg,
+        version,
+        output_dir,
+        results,
+    ) catch |err| blk: {
+        log.err("failed to generate Chocolatey package: {}", .{err});
+        break :blk null;
+    };
+
+    // Attach chocolatey_path to the first successful result for tracking.
+    if (chocolatey_path) |cp| {
+        for (results) |*r| {
+            if (r.success) {
+                r.chocolatey_path = cp;
                 break;
             }
         }
@@ -947,6 +1142,7 @@ fn packageWorker(
             .apk_path = null,
             .scoop_path = null,
             .winget_path = null,
+            .chocolatey_path = null,
             .error_message = if (error_msg_temp) |msg| allocator.dupe(u8, msg) catch null else null,
         };
         return;
@@ -970,6 +1166,7 @@ fn packageWorker(
     const copied_apk = if (result.apk_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_scoop = if (result.scoop_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_winget = if (result.winget_path) |path| allocator.dupe(u8, path) catch null else null;
+    const copied_chocolatey = if (result.chocolatey_path) |path| allocator.dupe(u8, path) catch null else null;
     const copied_error = if (result.error_message) |msg| allocator.dupe(u8, msg) catch null else null;
 
     context.allocator_mutex.lockUncancelable(context.io);
@@ -984,6 +1181,7 @@ fn packageWorker(
         .apk_path = copied_apk,
         .scoop_path = copied_scoop,
         .winget_path = copied_winget,
+        .chocolatey_path = copied_chocolatey,
         .error_message = copied_error,
     };
 
@@ -1060,6 +1258,7 @@ test "PackageSummary calculates correctly" {
         .apk_path = null,
         .scoop_path = null,
         .winget_path = null,
+        .chocolatey_path = null,
         .error_message = null,
     };
 
@@ -1072,6 +1271,7 @@ test "PackageSummary calculates correctly" {
         .apk_path = null,
         .scoop_path = null,
         .winget_path = null,
+        .chocolatey_path = null,
         .error_message = try allocator.dupe(u8, "Build failed"),
     };
 
@@ -1084,6 +1284,7 @@ test "PackageSummary calculates correctly" {
         .apk_path = null,
         .scoop_path = null,
         .winget_path = null,
+        .chocolatey_path = null,
         .error_message = null,
     };
 
@@ -1156,6 +1357,7 @@ test "packageWorkerLoop claims all indices with bounded workers" {
             .apk_path = null,
             .scoop_path = null,
             .winget_path = null,
+            .chocolatey_path = null,
             .error_message = try allocator.dupe(u8, "Build failed - no binary available"),
         };
     }

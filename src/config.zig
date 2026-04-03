@@ -156,6 +156,22 @@ pub const ScoopPackage = struct {
     }
 };
 
+/// Configuration for generating a Chocolatey package (Windows).
+pub const ChocolateyPackage = struct {
+    /// Override description (falls back to project.description).
+    description: ?[]const u8 = null,
+    /// Override homepage / projectUrl (falls back to GitHub repo URL).
+    homepage: ?[]const u8 = null,
+    /// Override authors field (falls back to GitHub owner).
+    authors: ?[]const u8 = null,
+    /// Override tags (space-separated, defaults to "<name> portable cli").
+    tags: ?[]const u8 = null,
+    /// Icon URL for the nuspec (optional, PNG/SVG recommended).
+    icon_url: ?[]const u8 = null,
+    /// Package source URL (falls back to GitHub releases URL).
+    package_source_url: ?[]const u8 = null,
+};
+
 /// Configuration for generating a Winget manifest (Windows Package Manager).
 pub const WingetPackage = struct {
     /// Publisher name for PackageIdentifier (e.g. "vmvarela").
@@ -184,6 +200,7 @@ pub const Packages = struct {
     homebrew: ?HomebrewPackage = null,
     scoop: ?ScoopPackage = null,
     winget: ?WingetPackage = null,
+    chocolatey: ?ChocolateyPackage = null,
 };
 
 pub const GitHubRelease = struct {
@@ -330,6 +347,14 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .fork_repo = try dupeOptStr(allocator, wg.fork_repo),
             .fork_ssh_key = try dupeOptStr(allocator, wg.fork_ssh_key),
         } else null;
+        const chocolatey: ?ChocolateyPackage = if (pkg.chocolatey) |ch| ChocolateyPackage{
+            .description = try dupeOptStr(allocator, ch.description),
+            .homepage = try dupeOptStr(allocator, ch.homepage),
+            .authors = try dupeOptStr(allocator, ch.authors),
+            .tags = try dupeOptStr(allocator, ch.tags),
+            .icon_url = try dupeOptStr(allocator, ch.icon_url),
+            .package_source_url = try dupeOptStr(allocator, ch.package_source_url),
+        } else null;
         break :blk Packages{
             .tarball = tarball,
             .deb = deb,
@@ -338,6 +363,7 @@ fn deepCopyConfig(allocator: std.mem.Allocator, src: Config) !Config {
             .homebrew = homebrew,
             .scoop = scoop,
             .winget = winget,
+            .chocolatey = chocolatey,
         };
     } else null;
 

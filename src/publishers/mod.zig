@@ -31,6 +31,12 @@ pub const publishWingetManifest = winget.publishWingetManifest;
 
 const scoop = @import("scoop.zig");
 const winget = @import("winget.zig");
+const chocolatey = @import("chocolatey.zig");
+
+pub const ChocolateyPublishOptions = chocolatey.ChocolateyPublishOptions;
+pub const ChocolateyPublishResult = chocolatey.ChocolateyPublishResult;
+pub const ChocolateyPublishError = chocolatey.ChocolateyPublishError;
+pub const publishChocolateyPackage = chocolatey.publishChocolateyPackage;
 
 pub const GitHubErrorCode = enum {
     none,
@@ -76,4 +82,8 @@ test "module exports" {
     _ = WingetPublishResult;
     _ = WingetPublishError;
     _ = publishWingetManifest;
+    _ = ChocolateyPublishOptions;
+    _ = ChocolateyPublishResult;
+    _ = ChocolateyPublishError;
+    _ = publishChocolateyPackage;
 }

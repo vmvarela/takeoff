@@ -76,6 +76,8 @@ pub const ReleaseOptions = struct {
     scoop: bool = false,
     /// Also generate/push Winget manifest and open PR to winget-pkgs after GitHub release.
     winget: bool = false,
+    /// Also push Chocolatey .nupkg to chocolatey.org after GitHub release.
+    chocolatey: bool = false,
     /// Path to dist directory (default: "dist")
     dist_dir: []const u8 = "dist",
     /// Path to CHANGELOG.md (default: "CHANGELOG.md")
@@ -296,6 +298,8 @@ pub const Command = union(enum) {
                     options.scoop = true;
                 } else if (std.mem.eql(u8, opt, "--winget")) {
                     options.winget = true;
+                } else if (std.mem.eql(u8, opt, "--chocolatey")) {
+                    options.chocolatey = true;
                 } else if (std.mem.eql(u8, opt, "--dist") or std.mem.eql(u8, opt, "-D")) {
                     i += 1;
                     if (i >= args.len) {
@@ -1275,7 +1279,6 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                     .license = project_license,
                     .dist_dir = opts.dist_dir,
                     .fork_repo = wg_cfg.?.fork_repo,
-                    .fork_ssh_key = wg_cfg.?.fork_ssh_key,
                     .github_token = github_token,
                     .dry_run = true,
                 };
@@ -1289,6 +1292,44 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                 stdout.print("\nWinget manifest (dry-run):\n", .{}) catch {};
                 stdout.print("  Manifest dir: {s}\n", .{wg_result.manifest_dir}) catch {};
                 stdout.print("  {s}\n", .{wg_result.message}) catch {};
+            }
+        }
+
+        if (opts.chocolatey) {
+            const ch_cfg = if (cfg.packages) |p| p.chocolatey else null;
+            if (ch_cfg == null) {
+                stdout.print("\nChocolatey: skipped (packages.chocolatey not configured)\n", .{}) catch {};
+            } else {
+                const chocolatey_version = if (std.mem.startsWith(u8, tag, "v")) tag[1..] else tag;
+                const environ = std.Options.debug_threaded_io.?.environ.process_environ;
+                const api_key = std.process.Environ.getAlloc(environ, allocator, "CHOCOLATEY_API_KEY") catch "";
+                defer allocator.free(api_key);
+
+                const choco_dir = std.fs.path.join(allocator, &.{ opts.dist_dir, "chocolatey" }) catch "";
+                defer if (choco_dir.ptr != "".ptr) allocator.free(choco_dir);
+                const nupkg_name = std.fmt.allocPrint(allocator, "{s}.{s}.nupkg", .{ cfg.project.name, chocolatey_version }) catch "";
+                defer if (nupkg_name.ptr != "".ptr) allocator.free(nupkg_name);
+                const nupkg_path = std.fs.path.join(allocator, &.{ choco_dir, nupkg_name }) catch "";
+                defer if (nupkg_path.ptr != "".ptr) allocator.free(nupkg_path);
+
+                if (nupkg_path.len > 0 and api_key.len > 0) {
+                    const ch_opts = TakeOff.publishers.ChocolateyPublishOptions{
+                        .nupkg_path = nupkg_path,
+                        .api_key = api_key,
+                        .dry_run = true,
+                    };
+                    var ch_result = TakeOff.publishers.publishChocolateyPackage(allocator, io, ch_opts) catch |err| {
+                        stdout.print("\nChocolatey dry-run failed: {s}\n", .{@errorName(err)}) catch {};
+                        return 0;
+                    };
+                    defer ch_result.deinit(allocator);
+                    stdout.print("\nChocolatey package (dry-run):\n", .{}) catch {};
+                    stdout.print("  {s}\n", .{ch_result.message}) catch {};
+                } else {
+                    stdout.print("\nChocolatey package (dry-run):\n", .{}) catch {};
+                    stdout.print("  Would push: {s}\n", .{nupkg_name}) catch {};
+                    if (api_key.len == 0) stdout.print("  (CHOCOLATEY_API_KEY not set)\n", .{}) catch {};
+                }
             }
         }
         return 0;
@@ -1468,7 +1509,6 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                     .license = project_license,
                     .dist_dir = opts.dist_dir,
                     .fork_repo = wg_cfg.?.fork_repo,
-                    .fork_ssh_key = wg_cfg.?.fork_ssh_key,
                     .github_token = github_token,
                     .dry_run = false,
                 };
@@ -1486,6 +1526,49 @@ fn executeRelease(allocator: std.mem.Allocator, io: std.Io, opts: ReleaseOptions
                     stdout.print("   PR URL: {s}\n", .{wg_result.pr_url}) catch {};
                 }
                 stdout.print("   {s}\n", .{wg_result.message}) catch {};
+            }
+        }
+
+        if (opts.chocolatey) {
+            const ch_cfg = if (cfg.packages) |p| p.chocolatey else null;
+            if (ch_cfg == null) {
+                stderr.print("Warning: --chocolatey requested but packages.chocolatey is not configured. Skipping Chocolatey push.\n", .{}) catch {};
+            } else {
+                const chocolatey_version = if (std.mem.startsWith(u8, tag, "v")) tag[1..] else tag;
+                const environ = std.Options.debug_threaded_io.?.environ.process_environ;
+                const api_key = std.process.Environ.getAlloc(environ, allocator, "CHOCOLATEY_API_KEY") catch "";
+                defer allocator.free(api_key);
+
+                if (api_key.len == 0) {
+                    stderr.print("Warning: CHOCOLATEY_API_KEY environment variable not set. Skipping Chocolatey push.\n", .{}) catch {};
+                } else {
+                    const choco_dir = std.fs.path.join(allocator, &.{ opts.dist_dir, "chocolatey" }) catch "";
+                    defer if (choco_dir.ptr != "".ptr) allocator.free(choco_dir);
+                    const nupkg_name = std.fmt.allocPrint(allocator, "{s}.{s}.nupkg", .{ cfg.project.name, chocolatey_version }) catch "";
+                    defer if (nupkg_name.ptr != "".ptr) allocator.free(nupkg_name);
+                    const nupkg_path = std.fs.path.join(allocator, &.{ choco_dir, nupkg_name }) catch "";
+                    defer if (nupkg_path.ptr != "".ptr) allocator.free(nupkg_path);
+
+                    if (nupkg_path.len == 0) {
+                        stderr.print("Warning: Failed to build Chocolatey package path.\n", .{}) catch {};
+                        return 0;
+                    }
+
+                    const ch_opts = TakeOff.publishers.ChocolateyPublishOptions{
+                        .nupkg_path = nupkg_path,
+                        .api_key = api_key,
+                        .dry_run = false,
+                    };
+
+                    var ch_result = TakeOff.publishers.publishChocolateyPackage(allocator, io, ch_opts) catch |err| {
+                        stderr.print("Warning: Chocolatey push failed: {s}\n", .{@errorName(err)}) catch {};
+                        return 0;
+                    };
+                    defer ch_result.deinit(allocator);
+
+                    stdout.print("\n🍫 Chocolatey package\n", .{}) catch {};
+                    stdout.print("   {s}\n", .{ch_result.message}) catch {};
+                }
             }
         }
         return 0;
@@ -1555,6 +1638,7 @@ const usage =
     \\      --homebrew   Generate Homebrew formula and push to tap repo
     \\      --scoop      Generate Scoop manifest and push to bucket repo
     \\      --winget     Generate Winget manifest and open PR to winget-pkgs
+    \\      --chocolatey Push Chocolatey .nupkg to chocolatey.org
     \\  -D, --dist DIR   Path to dist directory (default: "dist")
     \\  -c, --changelog  Path to CHANGELOG.md (default: "CHANGELOG.md")
     \\

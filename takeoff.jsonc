@@ -65,7 +65,9 @@
             "license": "MIT",
             "license_url": "https://github.com/vmvarela/takeoff/blob/master/LICENSE",
             "fork_repo": "vmvarela/winget-pkgs"
-        }
+        },
+        // Chocolatey package — portable CLI package for Windows
+        "chocolatey": {}
     },
 
     // GitHub Release configuration
